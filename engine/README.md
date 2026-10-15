@@ -21,6 +21,8 @@ A simple game emulated the classic Werewolf game, allowing LLMs to play
 | 网络 | 能访问 DeepSeek API |
 | 密钥 | DeepSeek API Key |
 
+> 建议至少 Python 3.12 以上, 否则需要改动部分类型注释写法
+
 ## 快速开始
 
 ### 1. 安装依赖
