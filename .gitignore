@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Project-specific additions ---
+
+# API keys: never commit. Copy ds_key.example.txt to ds_key.txt and paste your key.
+ds_key.txt
+*.key
+
+# Generated game exports/replays (written at runtime by the export feature)
+replays/
+
+# macOS
+.DS_Store
