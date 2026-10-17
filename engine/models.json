@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "note": [
+    "Per-seat models. This file is the only place model settings live;",
+    "the console can show it but cannot change it.",
+    "The key comes from ds_key.txt for DeepSeek seats; for any other provider",
+    "write \"api_key\" here, or name a \"key_file\", or an \"api_key_env\".",
+    "Seats not listed under \"seats\" use \"default\"; an empty default means the",
+    "model from ds_key.txt / the environment - i.e. the previous behaviour."
+  ],
+  "default": "",
+  "models": {
+    "ds4.1-flash": {
+      "kind": "deepseek",
+      "model": "deepseek-flash",
+      "reasoning_effort": "max",
+      "max_tokens": 8192,
+      "_comment": "DeepSeek V4.1 Flash, thinking at maximum effort (needs a big output budget: the thought is spent from it); key from ds_key.txt"
+    },
+    "gpt": {
+      "kind": "openai",
+      "model": "gpt-4o-mini",
+      "api_key_env": "OPENAI_API_KEY",
+      "_comment": "example for a future mixed game; inactive until a seat names it"
+    },
+    "kimi": {
+      "kind": "compatible",
+      "model": "kimi-k2-0905-preview",
+      "base_url": "https://api.moonshot.cn/v1",
+      "key_file": "moonshot_key.txt",
+      "_comment": "any OpenAI-shaped gateway: base_url is required"
+    },
+    "claude": {
+      "kind": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 2048,
+      "api_key_env": "ANTHROPIC_API_KEY"
+    }
+  },
+  "seats": {
+    "0": "ds4.1-flash",
+    "1": "ds4.1-flash"
+  }
+}

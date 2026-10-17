@@ -31,6 +31,7 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from enum import Enum
 from typing import Any, Iterable, Protocol
 
@@ -39,14 +40,26 @@ import i18n
 __all__ = [
     'DecisionKind', 'Observation', 'DecisionRequest', 'Decision',
     'classify', 'build_messages', 'decode', 'extract_json_object',
-    'LLMError', 'DecodeError', 'ProviderConfig',
+    'LLMError', 'BudgetExhausted', 'DecodeError', 'ProviderConfig',
     'OpenAICompatProvider', 'AnthropicProvider', 'make_provider',
-    'LLMController',
+    'LLMController', 'ModelSpec', 'ModelRegistry', 'parse_model_config',
+    'load_model_config', 'MODEL_FIELDS',
 ]
 
 
 class LLMError(RuntimeError):
     '''The provider could not be reached or returned nothing usable.'''
+
+
+class BudgetExhausted(LLMError):
+    '''
+    The reply was cut off before any content arrived.
+
+    A thinking model spends the budget on its chain of thought first, so a small
+    `max_tokens` yields finish_reason="length" with an empty message. That is not
+    the model's fault and retrying unchanged cannot help: the caller widens the
+    budget and asks again.
+    '''
 
 
 class DecodeError(ValueError):
@@ -55,12 +68,25 @@ class DecodeError(ValueError):
 
 class DecisionKind(Enum):
     '''What the engine is currently asking a player to do.'''
-    Kill = 'kill'
-    Save = 'save'
-    Query = 'query'
-    Vote = 'vote'
-    Speech = 'speech'
+    Kill = 'kill'                 # 女巫 poison
+    Save = 'save'                 # 女巫 antidote
+    Query = 'query'               # 预言家
+    Guard = 'guard'               # 守卫
+    Vote = 'vote'                 # 放逐投票
+    Speech = 'speech'             # 发言 / 竞选发言
+    Shot = 'shot'                 # 猎人 / 狼王 开枪
+    Badge = 'badge'               # 是否移交警徽 (yes/no)
+    BadgeTarget = 'badge_target'  # 警徽交给谁 (an id)
+    Police = 'police'             # 是否上警
+    Expose = 'expose'             # 狼人自爆
+    SpeechOrder = 'speech_order'  # 警长决定发言顺序
     Generic = 'generic'
+
+
+# Questions answerable with yes/no. The engine reads a string, and a blank
+# answer means "no" everywhere, so these decode to 'y' / 'n'.
+YES_NO_KINDS = frozenset({DecisionKind.Police, DecisionKind.Expose,
+                          DecisionKind.Badge, DecisionKind.SpeechOrder})
 
 
 def classify(key: str, prompt: str) -> DecisionKind:
@@ -68,20 +94,44 @@ def classify(key: str, prompt: str) -> DecisionKind:
     Work out the kind of decision from what the engine exposes.
 
     engine.py only hands over a prompt string plus the `key` used by
-    input_an_id(), so the mapping is by keyword.  If those prompts are ever
-    reworded, this is the single place to update.
+    input_an_id(), so the mapping is by keyword, with `key` checked first
+    because it is the stabler of the two. If those prompts are ever reworded,
+    this is the single place to update - and tests/test_bridge.py asserts that
+    every prompt a real game produces classifies to something specific.
     '''
-    if 'addresser' in prompt.lower():
+    text = prompt.lower()
+    if 'addresser' in text or 'speecher' in text:
         return DecisionKind.Speech
+    if key in ('target', 'guard'):
+        return DecisionKind.Guard
     if key == 'save':
         return DecisionKind.Save
     if key == 'kill':
         return DecisionKind.Kill
-    text = prompt.lower()
+    if 'expose your identification' in text:
+        return DecisionKind.Expose
+    if 'choose to be the police' in text:
+        return DecisionKind.Police
+    if 'comment order' in text:
+        return DecisionKind.SpeechOrder
+    # Two different questions mention the badge: "do you want to hand it on?"
+    # is yes/no, "which player?" takes an id. Treating them as one kind made the
+    # console offer 是/否 buttons for an id question, and the engine then looped
+    # on "invalid format" because 'y' is not a seat number.
+    if 'transmit your badge' in text:
+        return DecisionKind.Badge
+    if 'send your badge' in text or 'send a badge' in text:
+        return DecisionKind.BadgeTarget
+    if 'badge' in text:
+        return DecisionKind.Badge
+    if 'shoot' in text:
+        return DecisionKind.Shot
     if 'to save' in text:
         return DecisionKind.Save
     if 'to kill' in text:
         return DecisionKind.Kill
+    if 'to guard' in text:
+        return DecisionKind.Guard
     if 'query' in text:
         return DecisionKind.Query
     if 'vote' in text:
@@ -109,6 +159,12 @@ class Observation:
     earlier_rounds: tuple[str, ...] = ()
     private_facts: tuple[str, ...] = ()
     vote_tally: tuple[tuple[int, int], ...] = ()
+    # public political state: the sheriff and the election
+    sheriff: int | None = None
+    sheriff_badge_broken: bool = False
+    sheriff_candidates: tuple[int, ...] = ()
+    candidate_speeches: tuple[tuple[int, str], ...] = ()
+    exploded_wolves: int = 0
 
     def render(self, language: str | None = None) -> str:
         '''Human-readable public/private breakdown, used inside the user turn.'''
@@ -128,6 +184,21 @@ class Observation:
             lines.append(text['said'].format(said=said))
         else:
             lines.append(text['said_none'])
+        if self.sheriff is not None:
+            lines.append(text['sheriff'].format(sheriff=self.sheriff))
+        else:
+            lines.append(text['sheriff_none'])
+        if self.sheriff_badge_broken:
+            lines.append(text['sheriff_broken'])
+        if self.sheriff_candidates:
+            lines.append(text['candidates'].format(
+                ids=i18n.player_ids(self.sheriff_candidates, lang)))
+        if self.candidate_speeches:
+            said = ' | '.join(text['said_item'].format(player=p, text=body)
+                              for p, body in self.candidate_speeches)
+            lines.append(text['candidate_said'].format(said=said))
+        if self.exploded_wolves:
+            lines.append(text['exploded'].format(count=self.exploded_wolves))
         if self.vote_tally:
             separator = '，' if lang == 'zh' else ', '
             tally = separator.join(text['tally_item'].format(player=p, count=n)
@@ -163,101 +234,187 @@ class Decision:
     reasoning: str = ''
     raw: str = ''
     note: str = ''        # set when this is a fallback rather than a real reply
+    yes: bool | None = None   # only for a yes/no question
 
     def as_answer(self) -> str:
-        '''The string engine.py expects from game_input()/input_an_id().'''
+        '''
+        The string engine.py expects.
+
+        game_input()/input_an_id() read plain strings: an id, a statement, or
+        'y'/'n'. A blank string means "skip", which for every yes/no question
+        the engine asks is the safe "no" (it tears the badge, does not explode).
+        '''
         if self.kind is DecisionKind.Speech:
             return self.speech
+        if self.kind in YES_NO_KINDS:
+            return 'y' if self.yes else 'n'
         return '' if self.choice is None else str(self.choice)
 
 
-RULES: dict[str, str] = {'en': '''\
-A six-player social-deduction game (simplified Werewolf). Seats are numbered 0-5.
-Roles: 2 Wolves, 1 Prophet, 1 Witch, 2 Civilians, assigned at random.
+RULES: dict[str, str] = {'en': """\
+A twelve-player social-deduction game (Werewolf). Seats are numbered 0-11.
+Roles: 3 Wolves, 1 Wolf King, 1 Prophet, 1 Witch, 1 Guard, 1 Hunter, 4 Civilians.
 The game runs up to 10 rounds; each round is one Night followed by one Day.
 
 NIGHT, in this order:
-1. Every living Wolf names one player to kill (a Wolf may pass). Wolves cannot
-   name a Wolf. Every player named by any Wolf dies - if the Wolves disagree,
-   more than one player dies.
-2. The Prophet names one player and learns whether that player is a Wolf.
-3. The Witch is shown the players killed by the Wolves. She may name one of
-   those victims to kill, and may save one of those victims. Only that night's
-   victims are legal targets for her.
+1. Guard: names one player to protect, or passes. He may protect himself. The
+   same player may not be protected two nights in a row. A protected player
+   survives the Wolves' kill, but NOT the Witch's poison.
+2. Wolves (including the Wolf King): each names one player to kill, or passes.
+   They may name anyone alive, including a Wolf or themselves - every player
+   named by any Wolf dies, so a divided pack kills more than one player.
+3. Prophet: names one living player other than herself and learns that player's
+   camp (good or wolf). The Wolf King reads as a wolf.
+4. Witch: she is shown tonight's victims. She may use her poison once per game
+   on any living player except herself, and her antidote once per game on one of
+   tonight's victims (she may save herself from the second night on). A player
+   killed by poison cannot be saved by anything.
+   If the Witch saves a player who was also protected by the Guard, that player
+   dies anyway (the potion and the protection cancel out).
 
 DAY, in this order:
-1. All deaths from the night are announced publicly.
-2. Every living player makes one public statement, visible to everyone.
-3. Every living player votes for a player, or gives up. The player with the most
-   votes leaves the game; if the highest vote count is shared, nobody leaves.
+1. The night's deaths are announced; those players leave the game.
+2. The game may end here.
+3. On the first day only: the players elect a sheriff (see below), and the
+   players who died on the first night give a last statement before leaving.
+4. Every living player makes one public statement, in an order the sheriff
+   chooses (from himself, ascending or descending seat order).
+   A Wolf may, when it is his turn, declare himself a Wolf and leave the game at
+   once (self-explosion). His statement stands; every later statement that day
+   and the whole vote are skipped, and the game goes straight to the next night.
+5. Every living player votes for a player, or passes. The player with the most
+   votes leaves; a tie means nobody leaves.
+6. The game is judged again, then the next night begins.
+
+SHERIFF: elected on the first day. Candidates speak, everyone else votes; the
+candidate with the most votes becomes sheriff, and a tie or no candidate means
+no sheriff this game. The sheriff's vote counts 1.5. When the sheriff leaves the
+game he hands the badge to a living player of his choice, or tears it. If two
+Wolves have exploded, the badge is discarded.
+
+SHOTS: the Hunter may shoot one living player when he is voted out or killed by
+the Wolves (not when poisoned). The Wolf King may shoot one living player when he
+is voted out, and never when he is killed at night.
 
 WINNING:
-- The civilians (Prophet, Witch and Civilians) win as soon as no Wolf is alive.
-- The Wolves win as soon as no Prophet and no Witch are alive, or as soon as no
-  Civilian is alive.
-- If more than 10 rounds pass, the game is a draw.''',
-    'zh': '''\
-六人社交推理游戏（简化版狼人杀）。座位编号为 0-5。
-身份：2 名狼人、1 名预言家、1 名女巫、2 名平民，随机分配。
+- The good side (Prophet, Witch, Guard, Hunter, Civilians) wins when no Wolf is alive.
+- The Wolves win when every god (Prophet, Witch, Guard, Hunter) is out, or every
+  Civilian is out.
+- If more than 10 rounds pass, the game is a draw.""",
+    'zh': """\
+十二人社交推理游戏（狼人杀）。座位编号为 0-11。
+身份：3 名狼人、1 名狼王、1 名预言家、1 名女巫、1 名守卫、1 名猎人、4 名平民，随机分配。
 最多进行 10 轮，每轮包含一个夜晚和一个白天。
 
 夜晚按顺序进行：
-1. 每位存活的狼人指定一名玩家击杀（可以跳过）。狼人不能选择狼人。
-   被任意狼人指定的玩家都会死亡——如果狼人意见不一致，可能不止一人死亡。
-2. 预言家指定一名玩家，得知其是否为狼人。
-3. 女巫会看到被狼人击杀的玩家。她可以毒杀其中一名受害者，也可以救下其中一名。
-   当晚她的合法目标只有这些受害者。
+1. 守卫：守护一名玩家或放弃，可以守护自己；同一名玩家不能连续两晚被守护。
+   被守护者可以免疫狼刀，但不能免疫女巫的毒药。
+2. 狼人（包括狼王）：各自指定一名玩家击杀或放弃。可以选择任意存活玩家，
+   包括狼人和自己；被任意狼人指定的玩家都会死亡，因此狼队意见分散时可能死多人。
+3. 预言家：指定一名自己之外的存活玩家，得知其阵营（好人/狼人）。狼王属于狼人阵营。
+4. 女巫：会看到今晚被狼人击杀的玩家。全局只有一瓶毒药和一瓶解药：
+   毒药可以对任意非己存活玩家使用；解药只能救今晚被狼杀的玩家，从第二晚起可以自救。
+   被毒死的玩家无法被任何方式救回。
+   若女巫救下的玩家同时被守卫守护，该玩家仍然死亡（同守同救）。
 
 白天按顺序进行：
-1. 公布夜晚的所有死亡。
-2. 每位存活玩家发表一次公开陈述，所有人都能看到。
-3. 每位存活玩家投票给一名玩家，或弃权。得票最多的玩家出局；
-   如果最高票数并列，则无人出局。
+1. 公布昨夜死亡名单，这些玩家出局。
+2. 此时可能直接判定胜负。
+3. 仅第一天：进行警长竞选；第一天夜晚死亡的玩家发表遗言。
+4. 每位存活玩家按顺序发表一次公开陈述，顺序由警长决定（从警长开始，按座位正序或逆序）。
+   狼人可以在自己发言时自爆身份并立即出局：他的发言保留，当天之后的所有发言与投票都被跳过，
+   游戏直接进入下一夜晚。
+5. 每位存活玩家投票给一名玩家或弃权。得票最多者出局；最高票并列则无人出局。
+6. 再次判定胜负，然后进入下一天夜晚。
+
+警长：第一天竞选产生。竞选者发言，其余玩家投票；得票最多的竞选者成为警长，
+平票或无人竞选则本局无警长。警长的票计 1.5 票。警长出局时可以把警徽移交给一名存活玩家，
+或者撕毁；若已有两只狼自爆，警徽会被强制废弃。
+
+开枪：猎人被投票放逐或被狼刀死时可以开枪带走一名存活玩家（被毒死不能开枪）。
+狼王仅在被投票放逐时可以开枪，夜里被刀死不能开枪。
 
 胜负判定：
-- 只要没有狼人存活，好人阵营（预言家、女巫、平民）立即获胜。
-- 只要预言家和女巫都已不存活，或者所有平民都已不存活，狼人阵营立即获胜。
-- 超过 10 轮仍未分出胜负则为平局。''',
+- 没有狼人存活时，好人阵营（预言家、女巫、守卫、猎人、平民）获胜。
+- 所有神职（预言家、女巫、守卫、猎人）出局，或所有平民出局时，狼人阵营获胜。
+- 超过 10 轮仍未分出胜负则为平局。""",
 }
 
 ROLE_BRIEFING: dict[str, dict[str, str]] = {
     'en': {
-    'Wolf': (
-        'You are told which other player is a Wolf. Killing civilians and keeping '
-        'suspicion off yourself is how you win. You may invent a role for yourself '
-        'when you speak, but never contradict what your fellow Wolf says in public.'
-    ),
-    'Prophet': (
-        'Each night you may name one player and learn whether that player is a '
-        'Wolf; your results accumulate in your private notes. You win with the '
-        'civilians, and revealing too much too early tends to get you killed at '
-        'night - but staying silent lets the Wolves control the vote.'
-    ),
-    'Witch': (
-        'Each night you are shown the players the Wolves killed; you may kill one '
-        'of those victims and you may save one of them. You win with the '
-        'civilians. Spending a save or a kill at the wrong moment can lose the '
-        'game, so weigh whether the victim is likely to be an ally worth saving.'
-    ),
-    'Civilian': (
-        'You have no night action and no secret knowledge. You win by reading the '
-        'Wolves out of the information everyone shares: who died, who voted for '
-        'whom, and who changes their story.'
-    ),
+        'Wolf': (
+            "You are told who the rest of the pack is, including the Wolf King. "
+            "Killing the good side and keeping suspicion off yourself is how you "
+            "win. You may claim any role when you speak, but never contradict a "
+            "packmate in public. During your own statement you may also declare "
+            "yourself a Wolf: that ends the day at once and costs you your life, "
+            "so only do it to stop a vote that would kill a packmate."
+        ),
+        'Wolf King': (
+            "You hunt with the pack and know your packmates. If you are voted out "
+            "you may shoot one living player as you die - use it to take a god "
+            "with you. You cannot shoot when you are killed at night."
+        ),
+        'Prophet': (
+            "Each night you name one living player other than yourself and learn "
+            "that player's camp; results accumulate in your private notes. The "
+            "Wolf King reads as a wolf. You win with the good side. Claiming too "
+            "early gets you killed at night; staying silent lets the Wolves steer "
+            "the vote."
+        ),
+        'Witch': (
+            "You hold one poison and one antidote for the whole game. You are shown "
+            "tonight's victims: you may poison any living player except yourself, "
+            "and you may save one of tonight's victims (from the second night you "
+            "may save yourself). Poison always wins: a poisoned player cannot be "
+            "saved, and a player you save who was also guarded dies anyway."
+        ),
+        'Guard': (
+            "Each night you protect one player, possibly yourself, or pass. The same "
+            "player may not be protected two nights running. Protection stops the "
+            "Wolves' kill but not the Witch's poison, and if the Witch saves the "
+            "player you protected that player dies anyway - so think before "
+            "doubling up on someone."
+        ),
+        'Hunter': (
+            "You have no night action. When you are voted out, or killed by the "
+            "Wolves, you may shoot one living player as you die. If you are "
+            "poisoned you cannot shoot. Your threat is public, so how you vote and "
+            "how openly you claim your role both matter."
+        ),
+        'Civilian': (
+            "You have no night action and no secret knowledge. You win by reading "
+            "the Wolves out of what everyone shares: who died, who voted for whom, "
+            "who runs for sheriff, and who changes their story."
+        ),
     },
-    'zh': {'Wolf': '你会得知另一名狼人是谁。击杀好人、并让自己不被怀疑，就是获胜的方式。发言时你可以伪装成其他身份，但不要和你的狼队友公开矛盾。', 'Prophet': '每晚你可以指定一名玩家，得知其是否为狼人；查验结果会累积在你的私人记录中。你与好人阵营一同获胜。过早暴露身份容易在夜里被杀，但一直沉默会让狼人掌控投票。', 'Witch': '每晚你会看到被狼人击杀的玩家；你可以毒杀其中一名受害者，也可以救下其中一名。你与好人阵营一同获胜。解药和毒药用错时机可能直接输掉游戏，所以要判断这名受害者是否值得救。', 'Civilian': '你没有夜间行动，也没有任何秘密信息。你只能依靠所有人都能看到的信息找出狼人：谁死了、谁投了谁、谁的发言前后矛盾。'},
+    'zh': {
+        'Wolf': "你会得知包括狼王在内的全部狼队友。击杀好人、让自己不被怀疑就是获胜方式。发言时可以伪装成其他身份，但不要与狼队友公开矛盾。你也可以在自己发言时自爆：当天立即结束、你会出局，只有在能阻止狼队被投票放逐时才值得这么做。",
+        'Wolf King': "你与狼队一同行动，并知道所有狼队友。若你被投票放逐，可以在出局时开枪带走一名存活玩家，用来换掉一个神职；但夜里被刀死时不能开枪。",
+        'Prophet': "每晚你可以指定一名自己之外的存活玩家，得知其阵营；结果会累积在你的私人记录中。狼王会被验成狼人。你与好人阵营一同获胜。过早跳身份容易在夜里被杀，一直沉默又会让狼人掌控投票。",
+        'Witch': "全局只有一瓶毒药和一瓶解药。你会看到今晚被狼杀的玩家：毒药可以对任意非己存活玩家使用，解药只能救今晚被狼杀的玩家（第二晚起可以自救）。毒药优先：被毒死的玩家无法被救回；若你救的人同时被守卫守护，他仍然会死。",
+        'Guard': "每晚可以守护一名玩家（包括自己），也可以放弃；同一名玩家不能连续两晚被守护。守护只能挡狼刀，挡不住女巫的毒药；如果你守护的人又被女巫救下，他依然会死——所以同时保护同一个人前要谨慎。",
+        'Hunter': "你没有夜间行动。被投票放逐或被狼人刀死时，可以开枪带走一名存活玩家；被毒死则不能开枪。你的威胁是公开的，所以如何投票、是否跳身份都很关键。",
+        'Civilian': "你没有夜间行动，也没有秘密信息。你只能从所有人都能看到的信息里找出狼人：谁死了、谁投了谁、谁上了警、谁的发言前后矛盾。",
+    },
 }
+
 
 CONTRACT: dict[str, str] = {'en': '''\
 Reply with ONE JSON object and nothing else - no prose, no markdown fence:
 {"choice": 3, "speech": "Player 3 has been quiet all day.", "reasoning": "..."}
 
 "choice"     integer player id taken from the legal list, or null to pass when
-             passing is allowed. Required for kill/save/query/vote decisions.
+             passing is allowed. Required for kill/save/query/vote decisions; an
+             id that is not on the list is rejected, so never invent one.
 "speech"     the one public sentence to announce. Only used when you are asked
-             for a statement; leave it as "" otherwise.
+             for a statement; leave it as "" otherwise - a vote or a night action
+             says nothing, so analysis belongs in "reasoning".
 "reasoning"  one or two private sentences: why this move, who you suspect next.
              Never shown to the other players.
+"yes"        only for a yes/no question (running for sheriff, self-explosion,
+             handing the badge on, choosing the speaking order): true or false.
+             Omit it otherwise.
 Answer with JSON only. If you cannot decide, still answer with JSON and choose
 the pass option when it is legal.''',
     'zh': '''\
@@ -265,9 +422,13 @@ the pass option when it is legal.''',
 {"choice": 3, "speech": "玩家3今天一直不太说话。", "reasoning": "..."}
 
 "choice"     从合法列表中选择的玩家编号；在允许放弃时也可以用 null 表示放弃。
-             击杀/救人/查验/投票类问题必须给出编号。
-"speech"     要公开发表的那一句话。只在需要发言时使用，其他情况留空字符串。
+             击杀/救人/查验/投票类问题必须给出编号；不在列表中的编号会被判为无效，
+             不要自行发挥。
+"speech"     要公开发表的那一句话。只在需要发言时使用；投票、夜晚行动都不发言，
+             留空字符串，分析写进 "reasoning"。
 "reasoning"  一到两句私人推理：为什么这样选择、接下来怀疑谁。不会展示给其他玩家。
+"yes"        仅用于是非题（是否上警、是否自爆、是否移交警徽、发言顺序）：
+             用 true 或 false 回答；其他问题不要包含这个字段。
 只输出 JSON。如果无法决定，也必须输出 JSON，并在允许时选择放弃。''',
 }
 
@@ -283,6 +444,12 @@ LABELS: dict[str, dict[str, str]] = {
         'said': '- Statements made today: {said}',
         'said_none': '- Statements made today: none yet',
         'said_item': 'P{player}: {text}',
+        'sheriff': '- Sheriff (their vote counts 1.5): P{sheriff}',
+        'sheriff_none': '- Sheriff: none this game',
+        'sheriff_broken': '- The sheriff badge has been discarded',
+        'candidates': '- Candidates for sheriff: {ids}',
+        'candidate_said': '- Candidate statements: {said}',
+        'exploded': '- Wolves who have self-exploded so far: {count}',
         'tally': '- Votes cast so far today: {tally}',
         'tally_item': 'P{player}:{count}',
         'earlier': '- Earlier rounds:',
@@ -302,11 +469,16 @@ LABELS: dict[str, dict[str, str]] = {
         'legal_free': 'free text - you may say anything (one short sentence)',
         'legal_none': 'no legal choice exists',
         'legal_pass': '  (or null to pass)',
+        'legal_yesno': '"yes": true  or  "yes": false',
         'corrective': ('Your previous reply was rejected: {error}\n'
                        'Previous reply was: {previous}\n'
                        'Answer again with a single valid JSON object.'),
         'kind_kill': 'kill', 'kind_save': 'save', 'kind_query': 'query',
-        'kind_vote': 'vote', 'kind_speech': 'speech', 'kind_generic': 'generic',
+        'kind_guard': 'guard', 'kind_vote': 'vote', 'kind_speech': 'speech',
+        'kind_shot': 'shoot', 'kind_badge': 'badge', 'kind_badge_target': 'badge hand-over',
+        'kind_police': 'run for sheriff',
+        'kind_expose': 'self-explosion', 'kind_speech_order': 'speaking order (yes = descending seat order)',
+        'kind_generic': 'action',
     },
     'zh': {
         'public': '公开信息',
@@ -318,6 +490,12 @@ LABELS: dict[str, dict[str, str]] = {
         'said': '- 今日发言：{said}',
         'said_none': '- 今日发言：暂无',
         'said_item': '玩家{player}：{text}',
+        'sheriff': '- 警长：玩家{sheriff}（其票计 1.5 票）',
+        'sheriff_none': '- 本局暂无警长',
+        'sheriff_broken': '- 警徽已被撕毁',
+        'candidates': '- 参与竞选警长的玩家：{ids}',
+        'candidate_said': '- 竞选发言：{said}',
+        'exploded': '- 已自爆的狼人数量：{count}',
         'tally': '- 当前票数：{tally}',
         'tally_item': '玩家{player} {count} 票',
         'earlier': '- 往轮情况：',
@@ -336,16 +514,32 @@ LABELS: dict[str, dict[str, str]] = {
         'legal_free': '自由文本——你可以说任意一句话（一句话即可）',
         'legal_none': '没有任何合法选择',
         'legal_pass': '（也可以用 null 表示放弃）',
+        'legal_yesno': '"yes": true 或 "yes": false',
         'corrective': ('你上一次的回复被拒绝：{error}\n'
                        '上一次的回复是：{previous}\n'
                        '请重新只输出一个合法的 JSON 对象。'),
         'kind_kill': '击杀', 'kind_save': '救人', 'kind_query': '查验',
-        'kind_vote': '投票', 'kind_speech': '发言', 'kind_generic': '行动',
+        'kind_guard': '守护', 'kind_vote': '投票', 'kind_speech': '发言',
+        'kind_shot': '开枪', 'kind_badge': '警徽', 'kind_badge_target': '警徽移交',
+        'kind_police': '竞选警长',
+        'kind_expose': '自爆', 'kind_speech_order': '发言顺序',
+        'kind_generic': '行动',
         'q_kill': '你今晚要击杀哪名玩家？',
         'q_save': '你要救下哪名玩家？',
         'q_query': '你要查验哪名玩家？',
+        'q_guard': '你今晚要守护哪名玩家？（可以守护自己，也可以放弃）',
         'q_vote': '你要投票给谁？',
-        'q_speech': '请发表你的公开陈述。',
+        'q_speech': '请发表你的公开陈述（一句话）。',
+        'q_kill': '你要毒杀哪名玩家？（全局只有一瓶毒药）',
+        'q_save': '你要用解药救下哪名玩家？（只能救今晚被狼杀的人）',
+        'q_query': '你要查验哪名玩家？（会得知其阵营）',
+        'q_shot': '你可以开枪带走一名存活玩家。选择谁？',
+        'q_badge': '你要把警徽移交给其他玩家吗？',
+        'q_badge_target': '你要把警徽移交给哪名存活玩家？',
+        'q_police': '你要竞选警长吗？',
+        'q_expose': '你要自爆狼人身份吗？自爆会立即出局，并跳过今天的投票。',
+        'q_speech_order': '你希望从你开始按哪种顺序发言？（是=座位号从大到小，否=从小到大）',
+        'q_generic': '请按上面的规则做出你的选择。',
     },
 }
 
@@ -386,7 +580,9 @@ def build_messages(
         '\n'.join([text['section_answer'], CONTRACT.get(lang) or CONTRACT['en']]),
     ])
 
-    if request.allowed is None:
+    if request.kind in YES_NO_KINDS:
+        legal = text['legal_yesno']
+    elif request.allowed is None:
         legal = text['legal_free']
     else:
         if lang == 'zh':
@@ -427,13 +623,27 @@ _PASS_WORDS = {'', 'null', 'none', 'skip', 'pass', 'give up', 'giveup', 'no one'
 _CONTROL_ESCAPE = {'\n': '\\n', '\r': '\\r', '\t': '\\t'}
 
 
-def _repair_json(text: str) -> str:
+_CLOSER_OF = {'}': '{', ']': '['}
+_PYTHON_ONLY = frozenset(')\uff09')
+
+
+def _repair_json(text: str, close: bool = False) -> str:
     '''
-    Fix the two mistakes models make most often, both of which make json.loads
-    throw away an otherwise usable reply: raw control characters inside a string
-    (a literal newline in a multi-line "reasoning") and trailing commas.
+    Fix the slips that make json.loads throw away an otherwise usable reply.
+
+    Seen in real games: a raw control character inside a string (a literal
+    newline in a multi-line "reasoning"), a trailing comma, and a stray closing
+    bracket - a model once wrote
+    ``{"choice": 3, "reasoning": "...。" )}`` and lost the whole turn to it. A
+    ``)`` is never valid outside a JSON string, and a ``}``/``]`` that does not
+    close the innermost open bracket closes nothing, so both are dropped.
+
+    `close=True` additionally terminates what a reply cut short mid-object (a
+    small max_tokens does that): the open string is closed and the open brackets
+    are closed in order, so the fields that did arrive can still be read.
     '''
     chars: list[str] = []
+    stack: list[str] = []
     in_string = False
     escaped = False
     for char in text:
@@ -451,7 +661,27 @@ def _repair_json(text: str) -> str:
             continue
         if char == '"':
             in_string = True
+            chars.append(char)
+            continue
+        if char in '{[':
+            stack.append(char)
+            chars.append(char)
+            continue
+        if char in _CLOSER_OF:
+            if stack and stack[-1] == _CLOSER_OF[char]:
+                stack.pop()
+                chars.append(char)
+            continue                      # an unmatched closer closes nothing
+        if char in _PYTHON_ONLY:
+            continue                      # a Python slice/paren leaked into JSON
         chars.append(char)
+    if close:
+        if in_string:
+            # an escape still pending would swallow the quote we add, so give it
+            # one of its own first
+            chars.extend('""' if escaped else '"')
+        while stack:
+            chars.append('}' if stack.pop() == '{' else ']')
     return re.sub(r',(\s*[}\]])', r'\1', ''.join(chars))
 
 
@@ -476,7 +706,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
         candidates.append(braced)
 
     for candidate in candidates:
-        for form in (candidate, _repair_json(candidate)):
+        for form in (candidate, _repair_json(candidate), _repair_json(candidate, close=True)):
             try:
                 parsed = json.loads(form)
             except json.JSONDecodeError:
@@ -523,6 +753,33 @@ def _first_balanced_object(text: str) -> str | None:
             depth -= 1
             if depth == 0:
                 return text[start:index + 1]
+    return None
+
+
+_YES_WORDS = {'yes', 'y', 'true', '1', '是', '对', '好', '同意', '上警', '自爆'}
+_NO_WORDS = {'no', 'n', 'false', '0', '否', '不', '不要', '不同意'}
+
+
+def _coerce_yes(payload: dict[str, Any]) -> bool | None:
+    '''
+    Read a yes/no answer however the model phrased it.
+
+    `yes` is the documented field; a model that reuses `choice` or `answer`
+    with true/false or 是/否 is still understood rather than punished.
+    '''
+    for field in ('yes', 'answer', 'choice'):
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in _YES_WORDS:
+            return True
+        if text in _NO_WORDS:
+            return False
     return None
 
 
@@ -573,6 +830,12 @@ def decode(raw: str, request: DecisionRequest) -> Decision:
             raise DecodeError('the statement ("speech") was empty')
         return Decision(DecisionKind.Speech, None, speech.strip(), reasoning.strip(), raw)
 
+    if request.kind in YES_NO_KINDS:
+        yes = _coerce_yes(payload)
+        if yes is None:
+            raise DecodeError('this is a yes/no question: reply {"yes": true} or {"yes": false}')
+        return Decision(request.kind, None, speech.strip(), reasoning.strip(), raw, yes=yes)
+
     if 'choice' not in payload:
         raise DecodeError('the JSON object has no "choice" field')
 
@@ -590,6 +853,13 @@ def decode(raw: str, request: DecisionRequest) -> Decision:
 
 
 # -- providers -------------------------------------------------------------
+# '' means "whatever the provider defaults to"; 'off' disables thinking.
+REASONING_EFFORTS = frozenset({'', 'off', 'low', 'high', 'max'})
+
+# A ceiling for the automatic budget growth, so a runaway reply cannot ask for
+# an absurd amount. Well under DeepSeek's 384K, far above any real answer.
+MAX_OUTPUT_TOKENS = 32768
+
 DEFAULT_BASE_URLS = {
     'deepseek': 'https://api.deepseek.com/v1',
     'openai': 'https://api.openai.com/v1',
@@ -597,6 +867,8 @@ DEFAULT_BASE_URLS = {
     'compatible': '',        # any other OpenAI-shaped gateway: supply base_url
 }
 DEFAULT_MODELS = {
+    # The default stays the long-standing chat model: a seat that wants DeepSeek
+    # V4.1 (deepseek-flash) or deepseek-v4-pro asks for it in models.json.
     'deepseek': 'deepseek-chat',
     'openai': 'gpt-4o-mini',
     'anthropic': 'claude-3-5-haiku-latest',
@@ -618,9 +890,14 @@ class ProviderConfig:
     model: str = ''
     api_key: str = ''
     temperature: float = 0.8
-    max_tokens: int = 400
-    timeout: float = 60.0
+    # A thinking model spends tokens before it answers, so this has to leave room
+    # for the chain of thought as well as the JSON.
+    max_tokens: int = 1024
+    timeout: float = 120.0
     json_mode: bool = False       # ask for response_format=json_object when supported
+    # How hard a thinking model should think: '' keeps the provider default,
+    # 'off' disables thinking, 'low'/'high'/'max' map to reasoning_effort.
+    reasoning_effort: str = ''
 
     def __post_init__(self) -> None:
         self.kind = (self.kind or 'deepseek').strip().lower()
@@ -635,6 +912,12 @@ class ProviderConfig:
         self.model = self.model or DEFAULT_MODELS[self.kind]
         if not self.model:
             raise LLMError(f'kind {self.kind!r} needs an explicit model')
+        self.reasoning_effort = (self.reasoning_effort or '').strip().lower()
+        if self.reasoning_effort not in REASONING_EFFORTS:
+            raise LLMError(
+                f'unknown reasoning_effort {self.reasoning_effort!r}; expected one of '
+                + ', '.join(sorted(value for value in REASONING_EFFORTS if value))
+            )
 
     @classmethod
     def from_env(cls) -> 'ProviderConfig':
@@ -646,8 +929,9 @@ class ProviderConfig:
             model=os.getenv('LLM_MODEL', ''),
             api_key=key or '',
             temperature=float(os.getenv('LLM_TEMPERATURE', '0.8')),
-            max_tokens=int(os.getenv('LLM_MAX_TOKENS', '400')),
+            max_tokens=int(os.getenv('LLM_MAX_TOKENS', '1024')),
             json_mode=os.getenv('LLM_JSON_MODE', '').lower() in {'1', 'true', 'yes'},
+            reasoning_effort=os.getenv('LLM_REASONING_EFFORT', ''),
         )
 
     def describe(self) -> dict[str, Any]:
@@ -659,6 +943,7 @@ class ProviderConfig:
             'temperature': self.temperature,
             'max_tokens': self.max_tokens,
             'json_mode': self.json_mode,
+            'reasoning_effort': self.reasoning_effort,
             'has_key': bool(self.api_key),
         }
 
@@ -707,8 +992,28 @@ class OpenAICompatProvider:
                 'or paste one into the console before starting'
             )
         self.config = config
+        # A thinking model's chain of thought, kept for the caller to show: the
+        # JSON answer stays the only thing the engine sees.
+        self.last_reasoning = ''
+
+    def _thinking_payload(self) -> dict[str, Any]:
+        '''
+        Ask for a specific amount of thinking, on the providers that document it.
+
+        DeepSeek takes `reasoning_effort` (low/high/max) and disables thinking with
+        {"thinking": {"type": "disabled"}}. Other OpenAI-shaped gateways reject
+        unknown fields, so nothing is sent unless the effort was asked for and the
+        provider kind is known to understand it.
+        '''
+        effort = self.config.reasoning_effort
+        if not effort or self.config.kind != 'deepseek':
+            return {}
+        if effort == 'off':
+            return {'thinking': {'type': 'disabled'}}
+        return {'reasoning_effort': effort}
 
     def complete(self, system: str, user: str) -> str:
+        self.last_reasoning = ''
         payload: dict[str, Any] = {
             'model': self.config.model,
             'messages': [
@@ -720,6 +1025,7 @@ class OpenAICompatProvider:
         }
         if self.config.json_mode:
             payload['response_format'] = {'type': 'json_object'}
+        payload.update(self._thinking_payload())
 
         data = _post_json(
             f'{self.config.base_url}/chat/completions',
@@ -728,9 +1034,42 @@ class OpenAICompatProvider:
             self.config.timeout,
         )
         try:
-            return data['choices'][0]['message']['content'] or ''
+            choice = data['choices'][0]
+            message = choice['message']
         except (KeyError, IndexError, TypeError) as error:
             raise LLMError(f'unexpected completion shape: {json.dumps(data)[:300]}') from error
+        # DeepSeek returns its chain of thought as reasoning_content; some gateways
+        # use "reasoning", some a list of parts.
+        reasoning = message.get('reasoning_content') or message.get('reasoning') or ''
+        if isinstance(reasoning, list):
+            reasoning = ' '.join(str(part) for part in reasoning)
+        self.last_reasoning = str(reasoning).strip()
+        content = message.get('content') or ''
+        if not content.strip() and choice.get('finish_reason') == 'length':
+            raise self._budget_error(len(self.last_reasoning))
+        return content
+
+    def budget_hint(self, minimum: int = 0) -> int:
+        '''
+        A larger budget that leaves room for the answer after the thought.
+
+        A thought that already outran the budget will not fit in double of it, so
+        grow by 4x (2048 -> 8192), with a floor for small budgets and a cap that
+        still leaves the reply somewhere to land.
+        '''
+        return min(MAX_OUTPUT_TOKENS, max(minimum, self.config.max_tokens * 4, 4096))
+
+    def _budget_error(self, reasoning_chars: int) -> BudgetExhausted:
+        effort = self.config.reasoning_effort or 'default'
+        return BudgetExhausted(
+            f'ran out of {self.config.max_tokens} tokens while still thinking '
+            f'(finish_reason=length, {reasoning_chars} chars of reasoning, effort={effort}); '
+            f'raise max_tokens or lower reasoning_effort')
+
+    def widen_budget(self, minimum: int = 0) -> int:
+        '''Grow the output budget after a truncated thought; returns the new value.'''
+        self.config.max_tokens = self.budget_hint(minimum)
+        return self.config.max_tokens
 
 
 class AnthropicProvider:
@@ -742,8 +1081,10 @@ class AnthropicProvider:
                 'no API key configured - set ANTHROPIC_API_KEY (or LLM_API_KEY)'
             )
         self.config = config
+        self.last_reasoning = ''
 
     def complete(self, system: str, user: str) -> str:
+        self.last_reasoning = ''
         payload = {
             'model': self.config.model,
             'max_tokens': self.config.max_tokens,
@@ -758,10 +1099,235 @@ class AnthropicProvider:
             self.config.timeout,
         )
         try:
-            blocks = [b['text'] for b in data['content'] if b.get('type') == 'text']
+            blocks = data['content']
+            texts = [b['text'] for b in blocks if b.get('type') == 'text']
+            self.last_reasoning = ' '.join(
+                str(b.get('thinking') or '') for b in blocks
+                if b.get('type') in ('thinking', 'redacted_thinking')).strip()
         except (KeyError, TypeError) as error:
             raise LLMError(f'unexpected completion shape: {json.dumps(data)[:300]}') from error
-        return ''.join(blocks)
+        text = ''.join(texts)
+        if not text.strip() and data.get('stop_reason') == 'max_tokens':
+            raise BudgetExhausted(
+                f'ran out of {self.config.max_tokens} tokens before answering '
+                f'(stop_reason=max_tokens); raise max_tokens')
+        return text
+
+    def widen_budget(self, minimum: int = 0) -> int:
+        self.config.max_tokens = min(MAX_OUTPUT_TOKENS,
+                                     max(minimum, self.config.max_tokens * 4, 4096))
+        return self.config.max_tokens
+
+
+# -- per-seat models -------------------------------------------------------
+# A game can put a different model on every seat: one seat on DeepSeek, another
+# on GPT, another on Kimi. models.json names a few profiles and says which seat
+# uses which; nothing here is required, and with no file every seat keeps using
+# the single model configured in the console.
+MODEL_FIELDS = frozenset({
+    'kind', 'model', 'base_url', 'api_key', 'api_key_env', 'key_file',
+    'temperature', 'max_tokens', 'timeout', 'json_mode', 'reasoning_effort',
+})
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    '''One named model from models.json, resolvable against a fallback config.'''
+    name: str
+    fields: dict[str, Any]
+
+    def key_source(self, kind: str) -> str:
+        '''
+        Where this profile's key would come from, for display only.
+
+        Never the key itself: the console must be able to say "a key is set, from
+        models.json" without the value ever reaching the browser.
+        '''
+        if str(self.fields.get('api_key') or '').strip():
+            return 'models.json'
+        if str(self.fields.get('key_file') or '').strip():
+            return f"file {self.fields['key_file']}"
+        if str(self.fields.get('api_key_env') or '').strip():
+            return f"env {self.fields['api_key_env']}"
+        if kind == 'compatible':
+            return 'not set - name api_key_env or key_file'
+        return f"env {KEY_ENV.get(kind, 'LLM_API_KEY')}"
+
+    def _resolve_key(self, kind: str, fallback: ProviderConfig | None) -> str:
+        '''api_key, else key_file, else api_key_env, else the usual environment.'''
+        fields = self.fields
+        key = str(fields.get('api_key') or '').strip()
+        if not key:
+            key_file = str(fields.get('key_file') or '').strip()
+            if key_file:
+                try:
+                    key = Path(key_file).expanduser().read_text(encoding='utf-8').strip()
+                except OSError:
+                    key = ''
+        if not key:
+            env_name = str(fields.get('api_key_env') or '').strip()
+            key = os.getenv(env_name, '').strip() if env_name else ''
+        if not key and fallback is not None and fallback.kind == kind:
+            # the same provider, so the one key pasted in ds_key.txt serves both
+            key = fallback.api_key
+        if not key and kind != 'compatible':
+            # only this provider's own variable: LLM_API_KEY is generic and may
+            # hold a different vendor's key, which must not be sent elsewhere
+            env_name = KEY_ENV.get(kind, '')
+            key = os.getenv(env_name, '').strip() if env_name else ''
+        return key
+
+    def build(self, fallback: ProviderConfig | None) -> ProviderConfig:
+        '''
+        Turn the profile into a live config.
+
+        Anything the profile leaves out is inherited from the fallback config
+        when it is the same provider kind - that is how a seat can pin
+        'deepseek-flash' while the key still comes from the one place it was
+        pasted. A profile for another kind resolves its own key.
+        '''
+        fields = self.fields
+        kind = str(fields.get('kind') or (fallback.kind if fallback else 'deepseek')).strip().lower()
+        same_kind = fallback is not None and fallback.kind == kind
+        key = self._resolve_key(kind, fallback)
+
+        def pick(field: str, default: Any) -> Any:
+            if field in fields:
+                return fields[field]
+            if same_kind:
+                return getattr(fallback, field)
+            return default
+
+        return ProviderConfig(
+            kind=kind,
+            base_url=str(pick('base_url', '') or ''),
+            model=str(pick('model', '') or ''),
+            api_key=key,
+            temperature=float(pick('temperature', 0.8)),
+            max_tokens=int(pick('max_tokens', 1024)),
+            timeout=float(pick('timeout', 120.0)),
+            json_mode=bool(pick('json_mode', False)),
+            reasoning_effort=str(pick('reasoning_effort', '') or ''),
+        )
+
+
+@dataclass
+class ModelRegistry:
+    '''Named profiles and the seat -> profile assignment, with a default.'''
+    models: dict[str, ModelSpec]
+    seats: dict[int, str]
+    default: str = ''
+    source: str = ''
+
+    def profile_for(self, seat: int) -> str:
+        '''The profile name for a seat; '' means "whatever the console holds".'''
+        return self.seats.get(seat, self.default)
+
+    def config_for(self, seat: int, fallback: ProviderConfig) -> ProviderConfig:
+        name = self.profile_for(seat)
+        spec = self.models.get(name)
+        return spec.build(fallback) if spec is not None else fallback
+
+    def describe(self, fallback: ProviderConfig | None = None) -> dict[str, Any]:
+        '''Browser-safe: which model each seat plays, and whether it has a key.'''
+        models: dict[str, dict[str, Any]] = {}
+        for name, spec in self.models.items():
+            try:
+                config = spec.build(fallback)
+                models[name] = {'kind': config.kind, 'model': config.model,
+                                'base_url': config.base_url,
+                                'reasoning_effort': config.reasoning_effort,
+                                'max_tokens': config.max_tokens,
+                                'has_key': bool(config.api_key),
+                                'key_source': spec.key_source(config.kind)}
+            except LLMError as error:
+                models[name] = {'error': str(error)}
+        resolved: dict[str, dict[str, Any]] = {}
+        for seat in range(12):
+            name = self.profile_for(seat)
+            spec = self.models.get(name)
+            if spec is None:
+                # no profile: the seat uses whatever the environment configured
+                resolved[str(seat)] = {
+                    'profile': '',
+                    'kind': fallback.kind if fallback else '',
+                    'model': fallback.model if fallback else '',
+                }
+                continue
+            try:
+                config = spec.build(fallback)
+                resolved[str(seat)] = {'profile': name, 'kind': config.kind,
+                                       'model': config.model}
+            except LLMError as error:
+                resolved[str(seat)] = {'profile': name, 'error': str(error)}
+        return {'source': self.source, 'default': self.default,
+                'models': models, 'seats': resolved}
+
+
+def parse_model_config(data: Any, source: str = 'models.json') -> ModelRegistry:
+    '''Validate the JSON shape; every mistake names the field that caused it.'''
+    if not isinstance(data, dict):
+        raise LLMError(f'{source}: the top level must be an object')
+    unknown = set(data) - {'version', 'default', 'models', 'seats', 'note'}
+    if unknown:
+        raise LLMError(f'{source}: unknown top-level key(s): ' + ', '.join(sorted(unknown)))
+    raw_models = data.get('models')
+    if not isinstance(raw_models, dict) or not raw_models:
+        raise LLMError(f'{source}: "models" must be a non-empty object of profiles')
+
+    models: dict[str, ModelSpec] = {}
+    for name, profile in raw_models.items():
+        if not isinstance(profile, dict):
+            raise LLMError(f'{source}: model {name!r} must be an object')
+        documented = {k for k in profile if str(k).startswith('_') or k == 'note'}
+        bad = set(profile) - MODEL_FIELDS - documented
+        if bad:
+            raise LLMError(f'{source}: model {name!r} has unknown field(s): '
+                           + ', '.join(sorted(bad)))
+        # "_comment"/"note" are documentation inside a profile, not settings
+        fields = {k: v for k, v in profile.items()
+                  if not str(k).startswith('_') and k != 'note'}
+        key_file = str(fields.get('key_file') or '').strip()
+        if key_file and not Path(key_file).expanduser().is_absolute():
+            # a path in models.json is relative to that file, not to the cwd
+            fields['key_file'] = str((Path(source).resolve().parent / key_file))
+        models[str(name)] = ModelSpec(str(name), fields)
+
+    default = str(data.get('default') or '')
+    if default and default not in models:
+        raise LLMError(f'{source}: default {default!r} is not one of the models '
+                       + ', '.join(sorted(models)))
+
+    seats: dict[int, str] = {}
+    raw_seats = data.get('seats') or {}
+    if not isinstance(raw_seats, dict):
+        raise LLMError(f'{source}: "seats" must map seat numbers to model names')
+    for raw_seat, name in raw_seats.items():
+        try:
+            seat = int(raw_seat)
+        except (TypeError, ValueError):
+            raise LLMError(f'{source}: seat {raw_seat!r} is not a number') from None
+        if not 0 <= seat < 12:
+            raise LLMError(f'{source}: seat {seat} is outside the table (0-11)')
+        if name not in models:
+            raise LLMError(f'{source}: seat {seat} names unknown model {name!r}')
+        seats[seat] = str(name)
+
+    return ModelRegistry(models=models, seats=seats, default=default, source=source)
+
+
+def load_model_config(path: str | Path) -> ModelRegistry:
+    '''Read models.json. A broken file is an error, not a silent fallback.'''
+    path = Path(path)
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError as error:
+        raise LLMError(f'cannot read {path}: {error}') from error
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise LLMError(f'{path} is not valid JSON ({error.msg} at line {error.lineno})') from error
+    return parse_model_config(data, source=str(path))
 
 
 def make_provider(config: ProviderConfig) -> Provider:
@@ -803,6 +1369,20 @@ class LLMController:
                            system=system, user=user)
             try:
                 raw = self.provider.complete(system, user)
+            except BudgetExhausted as error:
+                # Retrying the same request would truncate again, so grow the
+                # budget first. The thought itself is worth keeping: it is what
+                # the console shows while the model works.
+                failure = str(error)
+                widen = getattr(self.provider, 'widen_budget', None)
+                if widen is not None and attempt < self.attempts:
+                    budget = widen()
+                    self._emit(kind='llm-error', viewer=observation.viewer,
+                               attempt=attempt, text=f'{failure} -> retrying with max_tokens={budget}')
+                else:
+                    self._emit(kind='llm-error', viewer=observation.viewer,
+                               attempt=attempt, text=failure)
+                continue
             except LLMError as error:
                 failure = str(error)
                 self._emit(kind='llm-error', viewer=observation.viewer, attempt=attempt, text=failure)
@@ -816,6 +1396,10 @@ class LLMController:
                 previous = raw
                 self._emit(kind='llm-error', viewer=observation.viewer, attempt=attempt, text=failure)
                 continue
+            if not decision.reasoning:
+                # a thinking model explains itself outside the JSON; keeping that
+                # text means the console can show why it moved
+                decision.reasoning = str(getattr(self.provider, 'last_reasoning', '') or '')
             return decision
 
         return self.fallback(request, failure, self.language)
@@ -828,5 +1412,9 @@ class LLMController:
         note = i18n.t('fallback_note', lang, error=failure)
         if request.kind is DecisionKind.Speech:
             return Decision(request.kind, None, i18n.t('fallback_speech', lang), note=note)
+        if request.kind in YES_NO_KINDS:
+            # "no" is the harmless answer: it does not explode and it tears the
+            # badge rather than handing it to a random player.
+            return Decision(request.kind, note=note, yes=False)
         pick = request.allowed[0] if request.required and request.allowed else None
         return Decision(request.kind, pick, note=note)

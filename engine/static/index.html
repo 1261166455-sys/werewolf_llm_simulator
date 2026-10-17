@@ -104,8 +104,11 @@
   .card[data-state=Exit] { opacity: .35; text-decoration: line-through; }
   .card[data-state=Exit] .state { color: var(--dim); }
   .card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
-  .card[data-job=Wolf] .job { color: var(--danger); }
+  .card[data-job=Wolf] .job, .card[data-job="Wolf King"] .job,
+  .card[data-job="Wolf Camp"] .job { color: var(--danger); }
+  .card.camp { border-color: var(--danger); }
   .card .job.concealed { opacity: .45; letter-spacing: .06em; }
+  .card .badge.sheriff { color: var(--warn); border-color: var(--warn); font-size: 12px; }
   .card .badge {
     font-size: 10px;
     border: 1px solid var(--accent);
@@ -113,6 +116,9 @@
     border-radius: 4px;
     padding: 0 3px;
   }
+  .seat-actions { display: inline-flex; gap: 6px; margin-left: 8px; }
+  .seat-actions button { padding: 3px 8px; font-size: 11px; }
+  .line.private-line { color: var(--warn); font-style: italic; opacity: .9; }
   .seat {
     background: var(--panel-2);
     border: 1px solid var(--line);
@@ -160,8 +166,15 @@
   .line.notice { color: var(--warn); font-style: italic; }
   .line.history { color: var(--dim); border-left: 2px solid var(--line); padding-left: 10px; margin: 8px 0; }
   .line.status { color: var(--ok); margin-top: 6px; }
-  footer {
+  #bottom-bar {
+    background: var(--panel);
     border-top: 1px solid var(--line);
+    /* the last grid row: the log above it scrolls, this stays put */
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  footer {
     background: var(--panel);
     padding: 10px 16px;
     min-height: 58px;
@@ -171,8 +184,48 @@
     gap: 8px 12px;
   }
   .waiting { color: var(--dim); font-style: italic; }
+  /* the model section is read-only: settings come from engine/models.json */
+  .model-summary { color: var(--dim); font-size: 12px; }
+  .model-summary.bad { color: var(--warn); }
+  .model-config {
+    margin: 8px 0 0;
+    padding: 8px 10px;
+    max-height: 40vh;
+    overflow: auto;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+  }
+  .model-config[hidden] { display: none; }
   .prompt-title { color: var(--accent); flex: 1 1 320px; }
   .choices { display: flex; gap: 6px; flex-wrap: wrap; flex: 0 0 auto; }
+  /* Private information for whoever is operating right now. Wiped the moment
+     that seat answers, so the screen never carries one player's secrets into
+     the next player's turn. */
+  #private {
+    border-top: 1px solid var(--accent);
+    background: var(--panel);
+    padding: 6px 16px 8px;
+    /* a fixed slice of the bar, scrolling inside, so the log height is stable */
+    max-height: 22vh;
+    overflow: auto;
+    font-size: 12px;
+    flex: 0 0 auto;
+  }
+  #private[hidden] { display: none; }
+  .priv-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .priv-tag { color: var(--accent); font-weight: 600; letter-spacing: .04em; }
+  .priv-role { color: var(--warn); }
+  .priv-facts { margin: 6px 0 0; padding-left: 18px; }
+  .priv-extra {
+    margin: 6px 0 0;
+    color: var(--dim);
+    white-space: pre-wrap;
+    font-family: inherit;
+  }
 </style>
 </head>
 <body>
@@ -207,23 +260,25 @@
     <div class="setup-group">
       <span data-i18n="seats">座位</span>
       <span id="seat-buttons"></span>
+      <span class="seat-actions">
+        <button id="all-llm" data-i18n="allModels">全部模型</button>
+        <button id="all-human" data-i18n="allHuman">全部真人</button>
+      </span>
     </div>
     <div class="setup-group">
-      <label><span data-i18n="api">接口</span>
-        <select id="llm-kind">
-          <option value="deepseek">deepseek</option>
-          <option value="openai">openai</option>
-          <option value="anthropic">anthropic</option>
-          <option value="compatible">other (openai-compatible)</option>
-        </select>
-      </label>
-      <label><span data-i18n="model">模型</span> <input type="text" id="llm-model" size="22" placeholder="deepseek-chat"></label>
-      <label><span data-i18n="baseUrl">接口地址</span> <input type="text" id="llm-base" size="30" data-i18n-placeholder="providerDefault" placeholder="使用默认地址"></label>
-      <label><span data-i18n="key">密钥</span> <input type="password" id="llm-key" size="18" data-i18n-placeholder="keyEnv" placeholder="或设置 DEEPSEEK_API_KEY"></label>
+      <span id="model-summary" class="model-summary"></span>
+      <button id="models-view" data-i18n="viewModels">查看模型配置</button>
       <button id="llm-test" data-i18n="testConnection">测试连接</button>
+      <button id="models-reload" data-i18n="reloadModels">重新读取配置</button>
+    </div>
+    <div class="setup-group">
       <label><input type="checkbox" id="show-prompts"> <span data-i18n="showPrompts">显示提示词</span></label>
       <label><input type="checkbox" id="reveal-jobs"> <span data-i18n="revealJobs">公开显示身份</span></label>
+      <label><input type="checkbox" id="show-thinking"> <span data-i18n="showThinking">显示模型思考过程</span></label>
+      <label><input type="checkbox" id="full-log"> <span data-i18n="fullLog">显示完整日志（含私有信息）</span></label>
+      <label><input type="checkbox" id="raw-output"> <span data-i18n="rawOutput">导出附文本记录</span></label>
     </div>
+    <pre class="model-config" id="model-config" hidden></pre>
   </div>
 </details>
 
@@ -232,7 +287,19 @@
   <section class="log" id="log"></section>
 </main>
 
+<div id="bottom-bar">
 <footer id="promptbar"></footer>
+
+<aside id="private">
+  <div class="priv-head">
+    <span class="priv-tag" data-i18n="privateInfo">私有信息</span>
+    <span id="priv-who"></span>
+    <span class="priv-role" id="priv-role"></span>
+  </div>
+  <ul class="priv-facts" id="priv-facts"></ul>
+  <pre class="priv-extra" id="priv-extra"></pre>
+</aside>
+</div>
 
 <script>
 const el = id => document.getElementById(id);
@@ -256,47 +323,79 @@ const I18N = {
     title: '狼人杀操作台', language: '语言', seed: '种子', randomSeed: '随机',
     newGame: '新游戏', replayDelay: '回放间隔', replayLast: '回放上一局',
     autoplay: '自动操作', setup: '模型与座位', summary: '{human} 名真人 / {model} 名模型',
-    seats: '座位', api: '接口', model: '模型', baseUrl: '接口地址', key: '密钥',
-    keyStored: '密钥已保存', keyEnv: '或设置 DEEPSEEK_API_KEY', providerDefault: '使用默认地址',
+    viewModels: '查看模型配置', reloadModels: '重新读取配置',
+    modelsTitle: '模型配置（{source}）',
+    modelsNone: '未找到 models.json——所有座位都使用环境中的 {kind}/{model}',
+    modelsBroken: 'models.json 无效：{error}',
+    modelsSeats: '座位分配', keyMissing: '✗ ', keyFound: '✓ ',
+    seats: '座位', model: '模型',
     testConnection: '测试连接', showPrompts: '显示提示词', revealJobs: '公开显示身份',
+    fullLog: '显示完整日志（含私有信息）', allModels: '全部模型', allHuman: '全部真人',
+    showThinking: '显示模型思考过程',
+    rawOutput: '导出附文本记录', noOperator: '当前没有玩家操作',
+    privMark: '[私]',
     exportGame: '导出本局', replayFiles: '导出文件', replaySelected: '回放所选',
     noExports: '（暂无导出文件）', steps: '{n} 步', send: '发送', message: '发言内容',
     waiting: '等待引擎…', modelDeciding: '模型思考中…', replaying: '回放中…',
     thinking: '正在决策', cycle: '第 {n} 轮', human: '真人', modelSeat: '模型',
     blank: '（空）', pass: '弃权', skipGiveUp: '弃权（不投票）', skipSave: '不使用解药',
-    skipKill: '不使用毒药', skip: '跳过', chose: '选择了 {value}', says: '说：{text}',
+    skipKill: '不使用毒药', skipGuard: '不守护', skip: '跳过', chose: '选择了 {value}',
+    says: '说：{text}',
+    thinkingNote: '想法：{text}',
     reasoning: '推理：', autoSpeech: '大家好，我先听听各位的想法。',
     role: '[身份]',
-    jobWolf: '狼人', jobProphet: '预言家', jobWitch: '女巫', jobCivilian: '平民',
+    jobWolf: '狼人', jobWolfKing: '狼王', jobProphet: '预言家', jobWitch: '女巫',
+    jobGuard: '守卫', jobHunter: '猎人', jobCivilian: '平民',
+    privateInfo: '私有信息', roleLabel: '身份', noPrivate: '暂无额外私有信息',
+    yes: '是', no: '否', wolfCamp: '狼阵营', sheriff: '警长', sheriffNone: '无警长', badgeBroken: '警徽已撕毁',
+    exploded: '已自爆 {n} 狼', candidates: '上警：{ids}',
     stateAlive: '存活', stateDead: '死亡', stateExit: '出局',
     stageInit: '初始化', stageReady: '初始化完成', stageNight: '夜晚', stageDay: '白天',
     endCivilian: '好人阵营获胜', endWolf: '狼人阵营获胜', endTie: '平局',
     runIdle: '空闲', runRunning: '进行中', runReplaying: '回放中', runFinished: '已结束', runError: '错误',
     kindKill: '击杀', kindSave: '救人', kindQuery: '查验', kindVote: '投票',
-    kindSpeech: '发言', kindGeneric: '行动',
+    kindSpeech: '发言', kindGeneric: '行动', kindGuard: '守护', kindShot: '开枪',
+    kindBadge: '警徽', kindBadgeTarget: '警徽移交', kindPolice: '竞选警长', kindExpose: '自爆',
+    kindSpeechOrder: '发言顺序',
   },
   en: {
     title: 'Werewolf Operator Console', language: 'language', seed: 'seed', randomSeed: 'random',
     newGame: 'New game', replayDelay: 'replay delay', replayLast: 'Replay last',
     autoplay: 'autoplay', setup: 'Model & seats', summary: '{human} human / {model} model',
-    seats: 'seats', api: 'api', model: 'model', baseUrl: 'base url', key: 'key',
-    keyStored: 'key stored', keyEnv: 'or set DEEPSEEK_API_KEY', providerDefault: 'provider default',
+    viewModels: 'view model config', reloadModels: 'reload config',
+    modelsTitle: 'model configuration ({source})',
+    modelsNone: 'no models.json - every seat uses {kind}/{model} from the environment',
+    modelsBroken: 'models.json is invalid: {error}',
+    modelsSeats: 'seat assignment', keyMissing: '✗ ', keyFound: '✓ ',
+    seats: 'seats', model: 'model',
     testConnection: 'Test connection', showPrompts: 'show prompts', revealJobs: 'reveal all roles',
+    fullLog: 'full log (incl. private)', allModels: 'all models', allHuman: 'all human',
+    showThinking: 'show model thinking',
+    rawOutput: 'also save a .txt record', noOperator: 'nobody is operating',
+    privMark: '[priv]',
     exportGame: 'Export game', replayFiles: 'exports', replaySelected: 'Replay selected',
     noExports: '(no exports yet)', steps: '{n} steps', send: 'Send', message: 'message',
     waiting: 'waiting for the engine…', modelDeciding: 'model is deciding…', replaying: 'replaying…',
     thinking: 'is deciding', cycle: 'cycle {n}', human: 'human', modelSeat: 'model',
     blank: '(blank)', pass: 'to pass', skipGiveUp: 'skip (give up)', skipSave: 'skip save',
-    skipKill: 'skip kill', skip: 'skip', chose: 'chose {value}', says: 'says "{text}"',
+    skipKill: 'skip kill', skipGuard: 'skip guard', skip: 'skip', chose: 'chose {value}',
+    says: 'says "{text}"',
+    thinkingNote: 'thinking: {text}',
     reasoning: 'reasoning: ', autoSpeech: 'hello everyone, I am listening first.',
     role: '[role]',
-    jobWolf: 'Wolf', jobProphet: 'Prophet', jobWitch: 'Witch', jobCivilian: 'Civilian',
+    jobWolf: 'Wolf', jobWolfKing: 'Wolf King', jobProphet: 'Prophet', jobWitch: 'Witch',
+    jobGuard: 'Guard', jobHunter: 'Hunter', jobCivilian: 'Civilian',
+    privateInfo: 'private', roleLabel: 'role', noPrivate: 'no further private information',
+    yes: 'Yes', no: 'No', wolfCamp: 'wolf camp', sheriff: 'sheriff', sheriffNone: 'no sheriff', badgeBroken: 'badge torn up',
+    exploded: '{n} wolf/wolves exploded', candidates: 'running: {ids}',
     stateAlive: 'Alive', stateDead: 'Dead', stateExit: 'Exit',
     stageInit: 'Initializing', stageReady: 'Finished_Initializing', stageNight: 'Night', stageDay: 'Day',
     endCivilian: 'End_Civilian_Win', endWolf: 'End_Wolf_Win', endTie: 'End_Tie',
     runIdle: 'idle', runRunning: 'running', runReplaying: 'replaying', runFinished: 'finished', runError: 'error',
     kindKill: 'kill', kindSave: 'save', kindQuery: 'query', kindVote: 'vote',
-    kindSpeech: 'speech', kindGeneric: 'generic',
+    kindSpeech: 'speech', kindGeneric: 'generic', kindGuard: 'guard', kindShot: 'shoot',
+    kindBadge: 'badge', kindBadgeTarget: 'badge hand-over', kindPolice: 'run for sheriff', kindExpose: 'self-explosion',
+    kindSpeechOrder: 'speaking order',
   },
 };
 let lang = 'zh';
@@ -308,8 +407,30 @@ function L(key, vars) {
   return text;
 }
 
-const JOB_KEY = { Wolf: 'jobWolf', Prophet: 'jobProphet', Witch: 'jobWitch', Civilian: 'jobCivilian' };
+const JOB_KEY = {
+  Wolf: 'jobWolf', 'Wolf King': 'jobWolfKing', Prophet: 'jobProphet', Witch: 'jobWitch',
+  Guard: 'jobGuard', Hunter: 'jobHunter', Civilian: 'jobCivilian',
+};
 const STATE_KEY = { Alive: 'stateAlive', Dead: 'stateDead', Exit: 'stateExit' };
+// Kinds whose question names the role ("input the player's ID to poison"), so
+// seeing the question is as good as seeing the role. Their traffic belongs in
+// the private panel; speech and vote are public and stay in the transcript.
+const SECRET_KINDS = new Set(['kill', 'save', 'query', 'guard', 'generic', 'expose']);
+
+// When on, private traffic is also written into the transcript with a marker,
+// which is the only way to read a whole game in order. Off by default: while a
+// human plays, the seat next to them should not be able to scroll up and read
+// the witch's potions.
+let showFullLog = false;
+
+// When on, each model's reasoning is written into the transcript as it decides,
+// marked private: the human watching can follow the thinking that leads to a
+// kill, a vote or a guard without opening every other private message.
+let showThinking = false;
+
+function privateLine(text) {
+  addLine(`${L('privMark')} ${text}`, 'private-line');
+}
 const STAGE_KEY = {
   Initializing: 'stageInit', Finished_Initializing: 'stageReady', Night: 'stageNight', Day: 'stageDay',
   End_Civilian_Win: 'endCivilian', End_Wolf_Win: 'endWolf', End_Tie: 'endTie',
@@ -317,7 +438,10 @@ const STAGE_KEY = {
 const RUN_KEY = { idle: 'runIdle', running: 'runRunning', replaying: 'runReplaying',
                   finished: 'runFinished', error: 'runError' };
 const KIND_KEY = { kill: 'kindKill', save: 'kindSave', query: 'kindQuery', vote: 'kindVote',
-                   speech: 'kindSpeech', generic: 'kindGeneric' };
+                   speech: 'kindSpeech', generic: 'kindGeneric', guard: 'kindGuard',
+                   shot: 'kindShot', badge: 'kindBadge', badge_target: 'kindBadgeTarget',
+                   police: 'kindPolice',
+                   expose: 'kindExpose', speech_order: 'kindSpeechOrder' };
 
 const seatName = n => (lang === 'zh' ? `玩家${n}` : `P${n}`);
 const jobName = job => L(JOB_KEY[job] || job);
@@ -346,7 +470,8 @@ function setLanguage(code) {
 
 // Roles are secret: the engine embeds them in its prompt text (translated), so
 // anything that is not the prompt being answered right now gets this treatment.
-const ROLE_TAGS = ['[Wolf]', '[Prophet]', '[Witch]', '[狼人]', '[预言家]', '[女巫]'];
+const ROLE_TAGS = ['[Wolf]', '[Wolf King]', '[Prophet]', '[Witch]', '[Guard]', '[Hunter]',
+                   '[狼人]', '[狼王]', '[预言家]', '[女巫]', '[守卫]', '[猎人]'];
 
 function maskedRoleTags(text) {
   if (revealJobs) return text;             // the operator asked to see everything
@@ -372,18 +497,34 @@ let revealJobs = false;
 // transcript locally instead of asking the server to resend it.
 let eventLog = [];
 
-function updateSetupSummary(model) {
-  const values = Object.values(seats);
-  const llm = values.filter(v => v === 'llm').length;
-  const total = values.length || 6;
+function updateSetupSummary() {
+  const models = Object.values(seats).filter(value => value === 'llm').length;
+  const humans = Object.keys(seats).length - models;
+  // which models the table actually calls, e.g. "ds4.1-flash ×2, deepseek-flash ×10"
+  let tail = '';
+  if (modelReport) {
+    if (!modelReport.source) tail = `${modelReport.fallback.kind}/${modelReport.fallback.model}`;
+    else {
+      const counts = {};
+      for (const info of Object.values(modelReport.seats || {})) {
+        const label = info.profile || `${info.kind}/${info.model}`;
+        counts[label] = (counts[label] || 0) + 1;
+      }
+      tail = Object.entries(counts).map(([label, n]) => `${label}×${n}`).join(' ');
+    }
+  }
   el('setup-summary').textContent =
-    `${L('setup')} — ` + L('summary', { human: total - llm, model: llm }) + (model ? ` · ${model}` : '');
+    `${L('setup')} — ${L('summary', { human: humans, model: models })}` + (tail ? ` · ${tail}` : '');
 }
 
+// The seats are the one model-adjacent thing the console does control: which
+// seat is played by a model and which by a human. Which model that is comes
+// from engine/models.json.
 function renderSeats() {
   const wrap = el('seat-buttons');
   wrap.innerHTML = '';
-  for (let i = 0; i < 6; i++) {
+  const count = Object.keys(seats).length || 12;
+  for (let i = 0; i < count; i++) {
     const isLlm = seats[i] === 'llm';
     const button = document.createElement('button');
     button.className = 'seat' + (isLlm ? ' llm' : '');
@@ -396,18 +537,16 @@ function renderSeats() {
     };
     wrap.appendChild(button);
   }
-  updateSetupSummary(el('llm-model').value.trim());
+  updateSetupSummary();
 }
 
-function renderLlmConfig(config) {
-  if (!config) return;
-  el('llm-kind').value = config.kind || 'openai';
-  el('llm-base').value = config.base_url || '';
-  el('llm-model').value = config.model || '';
-  // Never echo the key back: only report whether the server holds one.
-  el('llm-key').value = '';
-  el('llm-key').placeholder = config.has_key ? L('keyStored') : L('keyEnv');
-  updateSetupSummary(config.model);
+// One click for "everyone is a model" / "everyone is human"; which model each
+// seat then plays still comes from models.json.
+function setAllSeats(value) {
+  for (const seat of Object.keys(seats)) seats[seat] = value;
+  renderSeats();
+  refreshBoard();
+  send({ type: 'seats', seats });
 }
 
 const WIN_KEY = { Civilians: 'endCivilian', Wolves: 'endWolf', Tie: 'endTie' };
@@ -440,26 +579,85 @@ function renderReplays(files) {
   if (previous && files.some(f => f.name === previous)) select.value = previous;
 }
 
-function llmPayload() {
-  return {
-    kind: el('llm-kind').value,
-    base_url: el('llm-base').value.trim(),
-    model: el('llm-model').value.trim(),
-    api_key: el('llm-key').value,
-  };
+// Model settings live in engine/models.json and are read-only here: the page
+// only ever asks the server to describe them.
+let modelReport = null;
+
+function renderModelSummary() {
+  const box = el('model-summary');
+  if (!modelReport) { box.textContent = ''; return; }
+  if (modelReport.error) {
+    box.textContent = L('modelsBroken', { error: modelReport.error });
+    box.className = 'model-summary bad';
+    return;
+  }
+  box.className = 'model-summary';
+  if (!modelReport.source) {
+    box.textContent = L('modelsNone', { kind: modelReport.fallback.kind,
+                                       model: modelReport.fallback.model });
+    return;
+  }
+  const perSeat = {};
+  for (const [seat, info] of Object.entries(modelReport.seats || {})) {
+    const label = info.profile || `${info.kind}/${info.model}`;
+    perSeat[label] = (perSeat[label] || 0) + 1;
+  }
+  const parts = Object.entries(perSeat).map(([label, n]) => `${label} ×${n}`);
+  box.textContent = `${modelReport.source.replace(/^.*[\\/]/, '')}: ${parts.join('  ·  ')}`;
+}
+
+function renderModelConfig() {
+  const box = el('model-config');
+  if (!modelReport) { box.textContent = ''; return; }
+  const lines = [];
+  // the file name is enough - the full path only crowds the line
+  const where = (modelReport.source || '(none)').replace(/^.*[\\/]/, '');
+  lines.push(L('modelsTitle', { source: where }));
+  if (modelReport.error) lines.push(L('modelsBroken', { error: modelReport.error }));
+  for (const [name, info] of Object.entries(modelReport.models || {})) {
+    if (info.error) { lines.push(`${name}: ${info.error}`); continue; }
+    lines.push(`  ${name.padEnd(12)} ${info.kind}/${info.model}` +
+               `  [${info.reasoning_effort || 'default'} · ${info.max_tokens} tok]` +
+               `  key: ${info.has_key ? L('keyFound') + info.key_source
+                                     : L('keyMissing') + info.key_source}`);
+  }
+  const seats = [];
+  for (const [seat, info] of Object.entries(modelReport.seats || {})) {
+    seats.push(`${seat}=${info.profile || `${info.kind}/${info.model}`}`);
+  }
+  if (seats.length) lines.push('', L('modelsSeats') + ': ' + seats.join('  '));
+  box.textContent = lines.join('\n');
 }
 
 function atBottom() {
   return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
 }
 
+// Whether the transcript should follow new lines. Tracked from real user
+// scrolling instead of measured at append time: appending a line changes the
+// height, so a measurement taken afterwards says "not at bottom" and the view
+// drifts away on its own.
+let followLog = true;
+
+function pinToBottom() {
+  if (!followLog) return;
+  // one frame later, so wrapping and the bottom bar's size are already applied
+  requestAnimationFrame(() => { logEl.scrollTop = logEl.scrollHeight; });
+}
+
+logEl.addEventListener('scroll', () => { followLog = atBottom(); }, { passive: true });
+
+// the log itself resizes when the private panel grows, so re-pin then too
+if (window.ResizeObserver) {
+  new ResizeObserver(() => pinToBottom()).observe(logEl);
+}
+
 function addLine(text, cls = '') {
-  const stick = atBottom();
   const div = document.createElement('div');
   div.className = 'line ' + cls;
   div.textContent = text;
   logEl.appendChild(div);
-  if (stick) logEl.scrollTop = logEl.scrollHeight;
+  pinToBottom();
   return div;
 }
 
@@ -468,20 +666,33 @@ function setStatus(text, state) {
   statusEl.className = 'pill' + (state ? ' ' + state : '');
 }
 
+let police = null;          // sheriff seat, from the server's snapshot
+let badgeBroken = false;
+let exploded = 0;
+let candidates = [];
+// Seats the acting wolf knows are wolves. Only the camp is revealed, never which
+// of them is the Wolf King: the pack knows a wolf, not the rank.
+let campMates = [];
+
 function renderBoard(players) {
   lastPlayers = players || [];
   boardEl.innerHTML = '';
   for (const p of lastPlayers) {
     const revealed = revealJobs || p.id === activePlayer;
+    const campMate = !revealed && campMates.includes(p.id);
     const card = document.createElement('div');
-    card.className = 'card' + (revealed ? ' active' : '');
+    card.className = 'card' + (revealed ? ' active' : '') + (campMate ? ' camp' : '');
     card.dataset.state = p.state;
-    // Only tag data-job while revealed, otherwise the CSS rule for wolves would
-    // colour a concealed card red and give the role away anyway.
+    // Only tag data-job when the label actually names the role; a camp mate is
+    // tagged separately so the CSS can colour it without claiming a role.
     if (revealed) card.dataset.job = p.job;
-    const badge = seats[p.id] === 'llm' ? '<span class="badge">LLM</span>' : '';
+    else if (campMate) card.dataset.job = 'Wolf Camp';
+    const isSheriff = police !== null && p.id === police;
+    const badge = `${isSheriff ? '<span class="badge sheriff" title="sheriff">★</span>' : ''}` +
+                  (seats[p.id] === 'llm' ? '<span class="badge">LLM</span>' : '');
+    const label = revealed ? jobName(p.job) : (campMate ? L('wolfCamp') : '???');
     card.innerHTML = `<span class="pid">${seatName(p.id)}</span>
-                      <span class="job${revealed ? '' : ' concealed'}">${revealed ? jobName(p.job) : '???'}</span>
+                      <span class="job${revealed || campMate ? '' : ' concealed'}">${label}</span>
                       ${badge}
                       <span class="state">${stateName(p.state)}</span>`;
     boardEl.appendChild(card);
@@ -494,6 +705,18 @@ function refreshBoard() {
 
 function clearPrompt() {
   barEl.innerHTML = `<span class="waiting">${L('waiting')}</span>`;
+}
+
+// Every observation switch the server keeps, in one place so a reload and an
+// explicit change land in the same state.
+function loadOptions(ev) {
+  showPrompts = !!ev.show_prompts;
+  revealJobs = !!ev.reveal_jobs;
+  showThinking = !!ev.show_thinking;
+  el('show-prompts').checked = showPrompts;
+  el('reveal-jobs').checked = revealJobs;
+  el('show-thinking').checked = showThinking;
+  el('raw-output').checked = !!ev.raw_output;
 }
 
 function send(payload) {
@@ -514,10 +737,78 @@ function maybeAutoplay() {
   const ev = lastPrompt;
   window.setTimeout(() => {
     if (!pending || replaying || !el('autoplay').checked) return;
-    if (!ev.choices) answer(L('autoSpeech'));
-    else if (ev.choices.length) answer(ev.choices[0]);
-    else answer('');
+    if (ev.yesno) {
+      // A demo needs a real election: a few seats run, nobody blows themselves
+      // up, and the badge and speaking order are accepted.
+      if (ev.decision === 'police') answer(ev.player % 4 === 2 ? 'y' : 'n');
+      else if (ev.decision === 'expose') answer('n');
+      else answer('y');
+    } else if (ev.choices && ev.choices.length) {
+      answer(ev.choices[0]);
+    } else if (ev.choices) {
+      answer('');
+    } else {
+      answer(L('autoSpeech'));
+    }
   }, 120);
+}
+
+// -- private panel ---------------------------------------------------------
+// Everything the seat now acting may see, and nothing else. Wiped when that
+// seat answers, so the screen does not carry one player's secrets into the
+// next player's turn.
+function secretLine(text, toTranscript = showFullLog) {
+  if (toTranscript) privateLine(text);
+  const panel = el('private');
+  panel.hidden = false;
+  const box = el('priv-extra');
+  box.textContent += (box.textContent ? '\n' : '') + text;
+  panel.scrollTop = panel.scrollHeight;
+}
+
+function isPrivateEvent(ev) {
+  if (ev.kind === 'private' || ev.kind === 'llm-request' || ev.kind === 'llm-response') return true;
+  if (ev.kind === 'prompt' || ev.kind === 'answer') return ev.secret === true;
+  if (ev.kind === 'thinking' || ev.kind === 'decision') return SECRET_KINDS.has(ev.label);
+  return false;
+}
+
+function clearPrivate() {
+  campMates = [];
+  // The bar is permanent: show an empty state instead of hiding it, so the
+  // layout never jumps between "someone is acting" and "waiting".
+  el('private').hidden = false;
+  el('priv-who').textContent = '';
+  el('priv-role').textContent = '';
+  el('priv-extra').textContent = '';
+  const list = el('priv-facts');
+  list.innerHTML = '';
+  const li = document.createElement('li');
+  li.className = 'waiting';
+  li.textContent = L('noOperator');
+  list.appendChild(li);
+}
+
+function showPrivate(ev) {
+  const priv = ev.private || {};
+  campMates = priv.camp_mates || [];
+  el('private').hidden = false;
+  el('priv-who').textContent = seatName(ev.player);
+  el('priv-role').textContent = priv.role ? `${L('roleLabel')}: ${priv.role}` : '';
+  const list = el('priv-facts');
+  list.innerHTML = '';
+  const facts = priv.facts || [];
+  if (!facts.length) {
+    const li = document.createElement('li');
+    li.className = 'waiting';
+    li.textContent = L('noPrivate');
+    list.appendChild(li);
+  }
+  for (const fact of facts) {
+    const li = document.createElement('li');
+    li.textContent = fact;
+    list.appendChild(li);
+  }
 }
 
 function showPrompt(ev) {
@@ -546,7 +837,21 @@ function showPrompt(ev) {
   const choices = document.createElement('div');
   choices.className = 'choices';
 
-  if (ev.choices) {
+  if (ev.yesno) {
+    // a yes/no question: two buttons, plus skip, which the engine reads as "no"
+    for (const [value, label] of [['y', L('yes')], ['n', L('no')]]) {
+      const button = document.createElement('button');
+      button.className = 'choice' + (value === 'n' ? '' : ' primary');
+      button.textContent = label;
+      button.onclick = () => answer(value);
+      choices.appendChild(button);
+    }
+    const skip = document.createElement('button');
+    skip.textContent = L('skip');
+    skip.onclick = () => answer('');
+    choices.appendChild(skip);
+    barEl.appendChild(choices);
+  } else if (ev.choices) {
     for (const id of ev.choices) {
       const b = document.createElement('button');
       b.className = 'choice';
@@ -557,7 +862,9 @@ function showPrompt(ev) {
     if (!ev.required) {
       const skip = document.createElement('button');
       skip.textContent = ev.key === 'ID' ? L('skipGiveUp')
-        : (ev.key === 'save' ? L('skipSave') : (ev.key === 'kill' ? L('skipKill') : `${L('skip')} ${ev.key}`));
+        : (ev.key === 'save' ? L('skipSave')
+        : (ev.key === 'kill' ? L('skipKill')
+        : (ev.key === 'target' ? L('skipGuard') : `${L('skip')} ${ev.key}`)));
       skip.onclick = () => answer('');
       choices.appendChild(skip);
     }
@@ -592,7 +899,9 @@ function rebuild(events) {
   lastPrompt = null;
   pending = false;
   activePlayer = null;
+  followLog = true;
   for (const event of source) apply(event, true);
+  pinToBottom();
 }
 
 function apply(ev, record = true) {
@@ -610,43 +919,85 @@ function apply(ev, record = true) {
     activePlayer = null;
     pending = false;
     clearPrompt();
+    clearPrivate();
+    followLog = true;
     return;
   }
-  if (record) eventLog.push(ev);
+  // Private traffic is normally not stored: the transcript is re-rendered from
+  // eventLog on a language switch, and replaying a secret prompt or a model's
+  // reasoning would put it back on screen after its owner is done. The full-log
+  // view asks for exactly that, so it keeps them.
+  // a secret decision is only worth keeping for a rebuild if its reasoning is
+  // being shown; otherwise the replay would leak what the log hides
+  const keepThinking = showThinking && ev.kind === 'decision';
+  if (record && (!isPrivateEvent(ev) || showFullLog || keepThinking)) eventLog.push(ev);
   switch (ev.kind) {
     case 'log':
       addLine(ev.text);
+      break;
+    case 'private':
+      secretLine(ev.text);
       break;
     case 'history':
       addLine(ev.text, 'history');
       break;
     case 'prompt':
-      maskPromptLine();               // whoever was operating keeps their secret
-      lastPromptText = `> [${seatName(ev.player)}] ${ev.prompt}`;
-      lastPromptLine = addLine(lastPromptText, 'prompt');
+      if (ev.secret) {
+        // the question would name the role, so it stays off the shared transcript
+        showPrivate(ev);
+        if (showFullLog) privateLine(`> [${seatName(ev.player)}] ${ev.prompt}`);
+      } else {
+        maskPromptLine();             // whoever was operating keeps their secret
+        lastPromptText = `> [${seatName(ev.player)}] ${ev.prompt}`;
+        lastPromptLine = addLine(lastPromptText, 'prompt');
+      }
       showPrompt(ev);
       break;
     case 'answer':
-      addLine(`  = ${ev.value === '' ? L('blank') : ev.value}`, 'answer');
-      maskPromptLine();
+      if (!ev.secret) {
+        addLine(`  = ${ev.value === '' ? L('blank') : ev.value}`, 'answer');
+        maskPromptLine();
+      } else if (showFullLog) {
+        privateLine(`  = ${ev.value === '' ? L('blank') : ev.value}`);
+      }
       pending = false;
       activePlayer = null;
+      // wipe the operator's secrets first, so the board they leave behind does
+      // not keep showing the pack
+      clearPrivate();
       refreshBoard();
       clearPrompt();
       break;
     case 'notice':
       addLine(`! ${ev.text}`, 'notice');
       break;
-    case 'thinking':
-      addLine(`  … ${seatName(ev.player)} ${L('thinking')} (${kindName(ev.label)})`, 'reasoning');
+    case 'thinking': {
+      const line = `  … ${seatName(ev.player)} ${L('thinking')} (${kindName(ev.label)})`;
+      if (SECRET_KINDS.has(ev.label)) secretLine(line); else addLine(line, 'reasoning');
       break;
+    }
     case 'decision': {
+      const secret = SECRET_KINDS.has(ev.label);
+      // The thought comes first, the action second: this is what the model was
+      // weighing before it killed, voted or guarded. It stays private (the
+      // contract promises the other players never see it), but "show model
+      // thinking" lets the human watching read it without opening every other
+      // private message.
+      const showThought = showFullLog || showThinking;
+      if (ev.reasoning) secretLine(`    ${L('reasoning')}${ev.reasoning}`, showThought);
+      // Only a real statement is something the table heard. A vote, a kill or a
+      // guard has no public sentence, so if a model fills "speech" there anyway it
+      // is its thinking - keep it private and never phrase it as "says".
+      if (ev.speech && ev.label !== 'speech') {
+        secretLine(`    ${L('thinkingNote', { text: ev.speech })}`, showThought);
+      }
       const verb = ev.label === 'speech'
         ? L('says', { text: ev.value })
         : L('chose', { value: ev.value === '' ? L('pass') : ev.value });
-      addLine(`  ↳ ${seatName(ev.player)} ${verb}  [${kindName(ev.label)}]`, 'decision');
-      if (ev.reasoning) addLine(`    ${L('reasoning')}${ev.reasoning}`, 'reasoning');
-      if (ev.speech && ev.label !== 'speech') addLine(`    ${L('says', { text: ev.speech })}`, 'speech');
+      const line = `  ↳ ${seatName(ev.player)} ${verb}  [${kindName(ev.label)}]`;
+      // the action follows its reasoning: with the switch on, the observer reads
+      // the pair together instead of a thought with nothing attached to it
+      if (secret) secretLine(line, showThought); else addLine(line, 'decision');
       if (ev.note) addLine(`    ! ${ev.note}`, 'notice');
       break;
     }
@@ -655,34 +1006,43 @@ function apply(ev, record = true) {
       break;
     case 'llm-request':
       if (showPrompts) {
-        addLine(`— prompt sent for P${ev.viewer} (attempt ${ev.attempt}) —\n${ev.system}\n\n${ev.user}`, 'promptdump');
+        secretLine(`— prompt sent for P${ev.viewer} (attempt ${ev.attempt}) —\n${ev.system}\n\n${ev.user}`);
       }
       break;
     case 'llm-response':
-      if (showPrompts) addLine(`— raw reply (attempt ${ev.attempt}) —\n${ev.text}`, 'promptdump');
+      if (showPrompts) secretLine(`— raw reply (attempt ${ev.attempt}) —\n${ev.text}`);
       break;
     case 'seats':
       seats = ev.seats || {};
       renderSeats();
       refreshBoard();
       break;
-    case 'llm-config':
-      renderLlmConfig(ev.config);
+    case 'models':
+      modelReport = ev.models || null;
+      renderModelSummary();
+      renderModelConfig();
       break;
     case 'replays':
       renderReplays(ev.files);
       break;
     case 'options':
-      showPrompts = !!ev.show_prompts;
-      revealJobs = !!ev.reveal_jobs;
-      el('show-prompts').checked = showPrompts;
-      el('reveal-jobs').checked = revealJobs;
+      loadOptions(ev);
       break;
     case 'status':
       replaying = ev.state === 'replaying';
       seedEl.textContent = ev.seed != null ? `${L('seed')} ${ev.seed}` : '';
-      setStatus([stageName(ev.stage), L('cycle', { n: ev.cycles }), runStateName(ev.state), ev.message]
-        .filter(Boolean).join(' · '), ev.state);
+      police = ev.sheriff != null ? ev.sheriff : null;
+      badgeBroken = !!ev.badge_broken;
+      exploded = ev.exploded || 0;
+      candidates = ev.candidates || [];
+      const politics = [
+        police !== null ? `${L('sheriff')} ${seatName(police)}` : L('sheriffNone'),
+        badgeBroken ? L('badgeBroken') : '',
+        exploded ? L('exploded', { n: exploded }) : '',
+        candidates.length ? L('candidates', { ids: candidates.map(seatName).join('、') }) : '',
+      ].filter(Boolean).join(' · ');
+      setStatus([stageName(ev.stage), L('cycle', { n: ev.cycles }), runStateName(ev.state),
+                 politics, ev.message].filter(Boolean).join(' · '), ev.state);
       renderBoard(ev.players);
       if (ev.message) addLine(`— ${ev.message}`, 'status');
       if (ev.state === 'finished' || ev.state === 'error') {
@@ -696,12 +1056,11 @@ function apply(ev, record = true) {
     case 'snapshot':
       setLanguage(ev.language || 'zh');
       seats = ev.seats || {};
-      showPrompts = !!ev.show_prompts;
-      revealJobs = !!ev.reveal_jobs;
-      el('show-prompts').checked = showPrompts;
-      el('reveal-jobs').checked = revealJobs;
+      loadOptions(ev);
+      modelReport = ev.models || null;
       renderSeats();
-      renderLlmConfig(ev.llm);
+      renderModelSummary();
+      renderModelConfig();
       renderReplays(ev.replays);
       seedEl.textContent = ev.seed != null ? `${L('seed')} ${ev.seed}` : '';
       setStatus([stageName(ev.stage), L('cycle', { n: ev.cycles }), runStateName(ev.status), ev.message]
@@ -734,6 +1093,18 @@ el('replay').onclick = () => {
   send({ type: 'replay', delay: Number(el('delay').value) || 0, seed: el('seed-input').value.trim() || null });
 };
 el('autoplay').onchange = maybeAutoplay;
+el('show-thinking').onchange = () => {
+  showThinking = el('show-thinking').checked;
+  publishOptions();
+  rebuild(eventLog);            // past reasoning appears/disappears with the switch
+};
+el('full-log').onchange = () => {
+  showFullLog = el('full-log').checked;
+  // already-rendered private lines are not retro-fitted; the flag only governs
+  // what is written from now on (and what a rebuild will keep)
+};
+el('all-llm').onclick = () => setAllSeats('llm');
+el('all-human').onclick = () => setAllSeats('human');
 el('export').onclick = () => send({ type: 'export' });
 el('replay-file').onclick = () => {
   const name = el('replay-files').value;
@@ -742,21 +1113,29 @@ el('replay-file').onclick = () => {
 el('lang').onchange = () => send({ type: 'language', value: el('lang').value });
 
 el('llm-test').onclick = () => send({ type: 'llm-test' });
+el('models-view').onclick = () => {
+  const box = el('model-config');
+  box.hidden = !box.hidden;
+  if (!box.hidden) renderModelConfig();
+};
+el('models-reload').onclick = () => send({ type: 'models-reload' });
 function publishOptions() {
   send({ type: 'options', show_prompts: el('show-prompts').checked,
-         reveal_jobs: el('reveal-jobs').checked });
+         reveal_jobs: el('reveal-jobs').checked,
+         show_thinking: el('show-thinking').checked,
+         raw_output: el('raw-output').checked });
 }
 el('show-prompts').onchange = () => { showPrompts = el('show-prompts').checked; publishOptions(); };
+el('raw-output').onchange = publishOptions;
 el('reveal-jobs').onchange = () => {
   revealJobs = el('reveal-jobs').checked;
   publishOptions();
   rebuild(eventLog);            // re-render the backscroll under the new rule
 };
-for (const field of ['llm-kind', 'llm-model', 'llm-base', 'llm-key']) {
-  el(field).addEventListener('change', () => send({ type: 'llm', config: llmPayload() }));
-}
 
 refreshText();
+// the bar is permanent, so give the private panel its empty state on first paint
+clearPrivate();
 clearPrompt();
 renderSeats();
 renderReplays([]);

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import uvicorn
 
+import engine
 import i18n
 import ui
 
@@ -159,6 +160,20 @@ def main(argv: list[str] | None = None) -> int:
     print(i18n.t('banner_endpoint', lang, url=config.base_url))
     print(i18n.t('banner_key_loaded', lang, file=args.key_file.name) if config.api_key
           else i18n.t('banner_key_missing', lang))
+    # models.json may put a different model on each seat; say so before the game
+    registry = ui.CURRENT.models
+    if registry is not None:
+        for seat in range(engine.PLAYERS_COUNT):
+            name = registry.profile_for(seat)
+            if not name:
+                continue
+            seat_config = ui.CURRENT.model_for(seat)
+            print(i18n.t('banner_seat_model', lang, seat=seat, name=name,
+                         kind=seat_config.kind, model=seat_config.model,
+                         keytext='' if seat_config.api_key else i18n.t('banner_no_key', lang)))
+    elif ui.CURRENT.model_config_error:
+        print(i18n.t('models_broken', lang, error=ui.CURRENT.model_config_error),
+              file=sys.stderr)
     print(i18n.t('banner_page', lang, url=url), flush=True)
     if not config.api_key:
         print(i18n.t('key_missing_hint', lang, file=args.key_file), file=sys.stderr)

@@ -224,6 +224,9 @@ __marimo__/
 # API keys: never commit. Copy ds_key.example.txt to ds_key.txt and paste your key.
 ds_key.txt
 *.key
+# Per-model key files named from engine/models.json ("key_file": "moonshot_key.txt")
+*_key.txt
+engine/keys/
 
 # Generated game exports/replays (written at runtime by the export feature)
 replays/

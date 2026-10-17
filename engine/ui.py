@@ -17,6 +17,7 @@ import re
 import queue
 import random
 import threading
+import os
 import time
 import traceback
 from pathlib import Path
@@ -34,6 +35,10 @@ HOST = '127.0.0.1'
 PORT = 8000
 PAGE_PATH = Path(__file__).resolve().parent / 'static' / 'index.html'
 REPLAY_DIR = Path(__file__).resolve().parent / 'replays'
+# Optional per-seat models. Absent or empty means every seat uses the single
+# model configured in the console, which is the behaviour without the file.
+MODELS_PATH = Path(os.getenv('LLM_MODEL_CONFIG')
+                   or Path(__file__).resolve().parent / 'models.json')
 REPLAY_FORMAT = 'werewolf-replay'
 REPLAY_VERSION = 1
 REPLAY_DELAY = 0.3
@@ -49,6 +54,25 @@ WINNERS = {
     'End_Wolf_Win': 'Wolves',
     'End_Tie': 'Tie',
 }
+
+# Events the human-review .txt renders. Everything else in `Session.events` is
+# bridge bookkeeping (snapshots, seat edits, the replay list).
+RENDERED_EVENTS = frozenset({'log', 'private', 'prompt', 'answer', 'decision',
+                             'thinking', 'llm-error', 'history', 'notice'})
+
+# Decisions the whole table is entitled to see. The sheriff election, the badge,
+# the speaking order and a dying shot are all announced publicly by the rules;
+# everything else (a kill, a save, a query, a guard, a wolf deciding whether to
+# explode) would name a role, so it goes to the private panel.
+PUBLIC_KINDS = frozenset({
+    llm_interface.DecisionKind.Speech,
+    llm_interface.DecisionKind.Vote,
+    llm_interface.DecisionKind.Police,
+    llm_interface.DecisionKind.Badge,
+    llm_interface.DecisionKind.BadgeTarget,
+    llm_interface.DecisionKind.SpeechOrder,
+    llm_interface.DecisionKind.Shot,
+})
 
 
 class ReplayExhausted(Exception):
@@ -84,18 +108,34 @@ class Session:
 
         # Seats: 'human' answers through the browser, 'llm' answers through
         # llm_interface. Mixed games are the point - any split works.
-        self.seats: dict[int, str] = {i: 'human' for i in range(6)}
+        self.seats: dict[int, str] = {i: 'human' for i in range(engine.PLAYERS_COUNT)}
         try:
             self.provider_config = llm_interface.ProviderConfig.from_env()
             self.config_error = ''
         except llm_interface.LLMError as error:
             self.provider_config = llm_interface.ProviderConfig()
             self.config_error = str(error)
-        self.controller: llm_interface.LLMController | None = None
+        # One controller per seat, because each seat may play a different model.
+        self.controllers: dict[int, llm_interface.LLMController] = {}
+        self.models: llm_interface.ModelRegistry | None = None
+        self.model_config_error = ''
+        if MODELS_PATH.is_file():
+            try:
+                self.models = llm_interface.load_model_config(MODELS_PATH)
+            except llm_interface.LLMError as error:
+                self.model_config_error = str(error)
         self.show_prompts = False
         # Presentational only: the models' own observations are always filtered
         # per seat, so revealing roles here never changes what a model knows.
         self.reveal_jobs = False
+        # Show each model's reasoning in the transcript as it decides. Off by
+        # default like the other observation switches: it never changes what a
+        # model knows, only what the human watching can read.
+        self.show_thinking = False
+        # Off by default: the .json is the replayable record; the extra .txt is a
+        # human-review copy (thinking, private notes, prose state) that cannot be
+        # fed back into the engine.
+        self.raw_output = False
         self.language = i18n.get_language()
 
         # Per-seat private notes and the observed public timeline. The engine
@@ -127,12 +167,12 @@ class Session:
                 self.clients.discard(client)
 
     def begin_structured_input(self, key: str, required: bool, exclude) -> None:
-        # range(6) mirrors the hardcoded 0..5 range that JobAction.input_an_id
-        # asserts, so the choices offered here are exactly what it will accept
+        # The choices offered are exactly what JobAction.input_an_id will accept,
+        # so they have to follow the engine's table size
         self.structured = {
             'key': key,
             'required': bool(required),
-            'choices': [i for i in range(6) if i not in exclude],
+            'choices': [i for i in range(engine.PLAYERS_COUNT) if i not in exclude],
         }
 
     def end_structured_input(self) -> None:
@@ -149,17 +189,70 @@ class Session:
             return self._llm_answer(prompt, player, meta)
         return self._human_answer(prompt, player, meta)
 
+    def _secret(self, prompt: str, meta: dict[str, Any]) -> bool:
+        '''
+        True when the question itself gives the role away.
+
+        A statement, a vote, and the political decisions the rules make public
+        are all fair game for everyone: the sheriff's election, the badge, the
+        speaking order and a dying shot are announced to the whole table anyway.
+        "Input the player's ID to poison" identifies the witch, and "do you want
+        to expose your identification" would identify a wolf before he has
+        decided - those prompts and their answers stay in the private panel.
+        '''
+        kind = llm_interface.classify(str(meta.get('key') or ''), prompt)
+        return kind not in PUBLIC_KINDS
+
     def _prompt_event(self, prompt: str, player: int, meta: dict[str, Any],
                       controller: str) -> dict[str, Any]:
         # `prompt` is what the operator sees, `raw` is engine.py's own English text.
         # Keeping both lets the transcript be re-rendered on a language switch.
+        # `private` goes to the private panel, never the shared transcript: the
+        # question names the role ("input the ID to poison"), so publishing it
+        # would tell everyone who is acting.
+        kind = llm_interface.classify(str(meta.get('key') or ''), prompt)
         return {'kind': 'prompt', **meta, 'player': player, 'controller': controller,
-                'prompt': i18n.engine_text(prompt, self.language), 'raw': prompt}
+                'prompt': i18n.engine_text(prompt, self.language), 'raw': prompt,
+                'secret': self._secret(prompt, meta),
+                # the console renders 是/否 buttons from `yesno` instead of a
+                # text box, and labels the decision from `decision`
+                'decision': kind.value,
+                'yesno': kind in llm_interface.YES_NO_KINDS,
+                'private': self._private_view(player)}
+
+    def _private_view(self, player: int) -> dict[str, Any]:
+        '''
+        What only the seat now acting may see.
+
+        A human seat needs its own role and secrets to play at all, and the
+        private panel is wiped when that seat answers, so handing the screen to
+        the next player does not hand over the previous one's information.
+
+        `camp_mates` is the one thing the board needs as data rather than prose:
+        a wolf recognises the rest of the pack, but only as "the wolf camp" -
+        the Wolf King is deliberately indistinguishable from a plain Wolf.
+        '''
+        try:
+            observation = self.observation(player)
+        except Exception:
+            return {'role': None, 'facts': [], 'camp_mates': []}
+
+        camp_mates: list[int] = []
+        state = self.game.game_state if self.game is not None else None
+        wolf_camp = {job.value for job in engine.GameRule.WolfCamp}
+        if state is not None and observation.role in wolf_camp:
+            camp_mates = [i for i in engine.GameRuleDefinitions.players_with(
+                state, engine.GameRule.WolfCamp) if i != player]
+
+        return {'role': i18n.name(i18n.JOB_NAMES, observation.role, self.language),
+                'facts': list(observation.private_facts),
+                'camp_mates': camp_mates}
 
     def _recorded_answer(self, prompt: str, player: int, meta: dict[str, Any]) -> str:
         self.emit(self._prompt_event(prompt, player, meta, 'replay'))
         value = self._take_recorded()
-        self.emit({'kind': 'answer', 'prompt': prompt, 'player': player, 'value': value})
+        self.emit({'kind': 'answer', 'prompt': prompt, 'player': player, 'value': value,
+                   'secret': self._secret(prompt, meta)})
         return value
 
     def _take_recorded(self) -> str:
@@ -177,8 +270,15 @@ class Session:
         finally:
             self.pending_input = False
         self.answers.append(value)
-        self.emit({'kind': 'answer', 'prompt': prompt, 'player': player, 'value': value})
+        self.emit({'kind': 'answer', 'prompt': prompt, 'player': player, 'value': value,
+                   'secret': self._secret(prompt, meta)})
         return value
+
+    def model_for(self, player: int) -> llm_interface.ProviderConfig:
+        '''The model a seat plays: its profile if models.json assigns one.'''
+        if self.models is None:
+            return self.provider_config
+        return self.models.config_for(player, self.provider_config)
 
     def _llm_answer(self, prompt: str, player: int, meta: dict[str, Any]) -> str:
         request = llm_interface.DecisionRequest(
@@ -191,7 +291,7 @@ class Session:
         self.emit(self._prompt_event(prompt, player, meta, 'llm'))
         self.emit({'kind': 'thinking', 'player': player, 'label': request.kind.value})
         try:
-            decision = self._controller().decide(self.observation(player), request)
+            decision = self._controller(player).decide(self.observation(player), request)
         except llm_interface.LLMError as error:
             self.emit({'kind': 'llm-error', 'text': f'P{player}: {error}'})
             decision = llm_interface.LLMController.fallback(
@@ -205,15 +305,18 @@ class Session:
         # Recorded like a human answer, so replaying re-simulates the same game
         # from the same seed without paying for another round of API calls.
         self.answers.append(value)
-        self.emit({'kind': 'answer', 'prompt': prompt, 'player': player, 'value': value})
+        self.emit({'kind': 'answer', 'prompt': prompt, 'player': player, 'value': value,
+                   'secret': self._secret(prompt, meta)})
         return value
 
-    def _controller(self) -> llm_interface.LLMController:
-        if self.controller is None:
-            provider = llm_interface.make_provider(self.provider_config)
-            self.controller = llm_interface.LLMController(
+    def _controller(self, player: int) -> llm_interface.LLMController:
+        cached = self.controllers.get(player)
+        if cached is None:
+            provider = llm_interface.make_provider(self.model_for(player))
+            cached = llm_interface.LLMController(
                 provider, on_event=self._llm_event, language=self.language)
-        return self.controller
+            self.controllers[player] = cached
+        return cached
 
     def _llm_event(self, event: dict[str, Any]) -> None:
         if not self.show_prompts and event.get('kind') in ('llm-request', 'llm-response'):
@@ -239,31 +342,59 @@ class Session:
                 player_id = int(raw_id)
             except (TypeError, ValueError):
                 continue
-            if 0 <= player_id <= 5:
+            # the whole table, not the old six seats: a hardcoded 5 here meant
+            # seats 6-11 silently ignored every seat toggle
+            if 0 <= player_id < engine.PLAYERS_COUNT:
                 self.seats[player_id] = 'llm' if str(controller) == 'llm' else 'human'
         self.emit({'kind': 'seats', 'seats': dict(self.seats)})
 
-    def configure_llm(self, config: dict[str, Any]) -> bool:
-        current = self.provider_config
+    def model_report(self) -> dict[str, Any]:
+        """
+        What the console may show about the models.
+
+        Model settings live in models.json now, so the page reads them and never
+        writes them. Keys never leave the process: this says whether one exists
+        and where it came from, not what it is.
+        """
+        fallback = self.provider_config
+        report: dict[str, Any] = {
+            'fallback': {'kind': fallback.kind, 'model': fallback.model,
+                         'has_key': bool(fallback.api_key)},
+            'seats': {str(seat): {'profile': '', 'kind': fallback.kind,
+                                  'model': fallback.model}
+                      for seat in range(engine.PLAYERS_COUNT)},
+            'models': {},
+            'default': '',
+            'source': '',
+            'error': self.model_config_error,
+        }
+        if self.models is None:
+            return report
+        described = self.models.describe(fallback)
+        report.update({
+            'source': described['source'],
+            'default': described['default'],
+            'models': described['models'],
+            'seats': described['seats'],
+        })
+        return report
+
+    def reload_models(self) -> bool:
+        """Re-read models.json, so an edit does not need a server restart."""
+        self.controllers.clear()
+        if not MODELS_PATH.is_file():
+            self.models = None
+            self.model_config_error = ''
+            return True
         try:
-            self.provider_config = llm_interface.ProviderConfig(
-                kind=str(config.get('kind') or current.kind),
-                base_url=str(config.get('base_url', current.base_url)),
-                model=str(config.get('model', current.model)),
-                api_key=str(config.get('api_key') or current.api_key),
-                temperature=float(config.get('temperature', current.temperature)),
-                max_tokens=int(config.get('max_tokens', current.max_tokens)),
-                json_mode=bool(config.get('json_mode', current.json_mode)),
-            )
-        except (llm_interface.LLMError, TypeError, ValueError) as error:
+            self.models = llm_interface.load_model_config(MODELS_PATH)
+        except llm_interface.LLMError as error:
+            # keep the previous registry: a typo must not take the game down
+            self.model_config_error = str(error)
             self.emit({'kind': 'llm-error',
                        'text': i18n.t('bad_settings', self.language, error=error)})
             return False
-        self.controller = None          # settings changed, so rebuild the client
-        self.config_error = ''
-        # describe() carries its own 'kind' key, so nest it rather than spreading
-        # it into the envelope - it would otherwise overwrite the event kind.
-        self.emit({'kind': 'llm-config', 'config': self.provider_config.describe()})
+        self.model_config_error = ''
         return True
 
     def test_llm(self) -> None:
@@ -272,9 +403,20 @@ class Session:
         self.emit({'kind': 'notice', 'text': i18n.t('contacting', self.language)})
         threading.Thread(target=self._test_llm_worker, name='llm-test', daemon=True).start()
 
+    def _distinct_models(self) -> list[tuple[str, llm_interface.ProviderConfig]]:
+        """Every model the table would actually call, once each."""
+        seen: dict[tuple[str, str, str], tuple[str, llm_interface.ProviderConfig]] = {}
+        for seat in range(engine.PLAYERS_COUNT):
+            config = self.model_for(seat)
+            key = (config.kind, config.base_url, config.model)
+            if key not in seen:
+                name = self.models.profile_for(seat) if self.models else ''
+                seen[key] = (name or config.model, config)
+        return list(seen.values())
+
     def _test_llm_worker(self) -> None:
         '''
-        Probe with the same prompt shape real decisions use.
+        Probe each model with the same prompt shape real decisions use.
 
         A terse "reply with JSON" probe is not representative: deepseek-chat
         answered one with a placeholder instead of a number, which said nothing
@@ -289,25 +431,27 @@ class Session:
         request = llm_interface.DecisionRequest(
             llm_interface.DecisionKind.Vote, 'Vote whom?', (1, 2, 3, 4, 5), required=False,
         )
-        try:
-            provider = llm_interface.make_provider(self.provider_config)
-            raw = provider.complete(*llm_interface.build_messages(observation, request))
-        except llm_interface.LLMError as error:
-            self.emit({'kind': 'llm-error',
-                       'text': i18n.t('conn_failed', self.language, error=error)})
-            return
-        try:
-            decision = llm_interface.decode(raw, request)
-        except llm_interface.DecodeError as error:
-            self.emit({'kind': 'llm-error', 'text': i18n.t(
-                'decode_failed', self.language, error=error, raw=raw.strip()[:160])})
-            return
-        picked = (i18n.t('choose_pass', self.language) if decision.choice is None
-                  else i18n.t('choose_choice', self.language, choice=decision.choice))
-        self.emit({'kind': 'notice',
-                   'text': i18n.t('model_ready', self.language, picked=picked)})
-        if self.show_prompts:
-            self.emit({'kind': 'llm-response', 'viewer': -1, 'attempt': 1, 'text': raw.strip()})
+        system, user = llm_interface.build_messages(observation, request)
+        for name, config in self._distinct_models():
+            try:
+                provider = llm_interface.make_provider(config)
+                raw = provider.complete(system, user)
+                decision = llm_interface.decode(raw, request)
+            except llm_interface.LLMError as error:
+                self.emit({'kind': 'llm-error', 'text': i18n.t(
+                    'conn_failed_model', self.language, model=name, error=error)})
+                continue
+            except llm_interface.DecodeError as error:
+                self.emit({'kind': 'llm-error', 'text': i18n.t(
+                    'decode_failed', self.language, error=error, raw=raw.strip()[:160])})
+                continue
+            picked = (i18n.t('choose_pass', self.language) if decision.choice is None
+                      else i18n.t('choose_choice', self.language, choice=decision.choice))
+            self.emit({'kind': 'notice', 'text': i18n.t(
+                'model_ready', self.language, model=name, picked=picked)})
+            if self.show_prompts:
+                self.emit({'kind': 'llm-response', 'viewer': -1, 'attempt': 1,
+                           'text': raw.strip()})
 
     def set_language(self, code: str) -> bool:
         '''Switch language and re-render the whole transcript.'''
@@ -316,8 +460,8 @@ class Session:
                        'text': i18n.t('unknown_language', self.language, code=code)})
             return False
         self.language = i18n.set_language(code)
-        if self.controller is not None:
-            self.controller.language = self.language
+        for controller in self.controllers.values():
+            controller.language = self.language
         # Announce first: the client switches its own strings, then rebuilds the
         # transcript from the re-emitted events below.
         self.emit({'kind': 'language', 'value': self.language,
@@ -383,18 +527,135 @@ class Session:
             'seed': self.seed,
             'model': {'kind': self.provider_config.kind, 'model': self.provider_config.model},
             'seats': dict(self.seats),
-            'result': {k: v for k, v in self.snapshot().items() if k != 'players'},
+            # the roles and fates belong in the record too: the .json is the
+            # replayable half, and the .txt renders this same block as prose
+            'result': self.snapshot(),
             'answers': list(self.answers),
             'events': list(self.events),
         }
         REPLAY_DIR.mkdir(parents=True, exist_ok=True)
         path = REPLAY_DIR / filename
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
+        extra = ''
+        if self.raw_output:
+            text_path = path.with_suffix('.txt')
+            text_path.write_text(self.render_text(payload), encoding='utf-8')
+            extra = i18n.t('exported_text', self.language, file=text_path.name)
         self.emit({'kind': 'notice',
                    'text': i18n.t('exported', self.language, file=path.name,
-                                  steps=len(self.answers))})
+                                  steps=len(self.answers)) + extra})
         self.emit({'kind': 'replays', 'files': self.list_replays()})
         return path
+
+    def render_text(self, payload: dict[str, Any]) -> str:
+        '''
+        A human-review copy of an exported game.
+
+        The .json stays the only replayable artefact (it carries the seed and the
+        exact answers); this file is prose, because a reviewer wants to read a
+        game rather than diff JSON: the seating and result, every seat's role and
+        fate, then the whole stream with the private half marked and the models'
+        reasoning inline.
+        '''
+        lang = self.language
+
+        def L(key: str, **kwargs: Any) -> str:
+            return i18n.t(key, lang, **kwargs)
+
+        result = payload.get('result') or {}
+        seats = payload.get('seats') or {}
+        players = result.get('players') or []
+        model = payload.get('model') or {}
+        winner = result.get('winner')
+
+        lines = [L('text_title'), '']
+        lines.append(L('text_exported_at', when=payload.get('exported_at', '')))
+        lines.append(L('text_seed', seed=payload.get('seed')))
+        lines.append(L('text_model', model=f"{model.get('kind', '')}/{model.get('model', '')}"))
+        lines.append(L('text_language', code=lang))
+        lines.append(L('text_rounds', stage=result.get('stage', ''),
+                       cycles=result.get('cycles', 0),
+                       state=L('text_finished') if payload.get('complete') else L('text_unfinished')))
+        lines.append(L('text_result', result=i18n.name(i18n.CAMP_NAMES, winner, lang)
+                       if winner else L('text_no_result')))
+        sheriff = result.get('sheriff')
+        lines.append(L('text_sheriff', sheriff=f'P{sheriff}' if sheriff is not None else L('text_absent')))
+        lines.append(L('text_badge_state',
+                       state=L('text_badge_lost') if result.get('badge_broken') else L('text_badge_whole')))
+        lines.append(L('text_exploded', count=result.get('exploded', 0)))
+        lines.append(L('text_seats', seats='  '.join(
+            f"P{seat}={seats.get(str(seat), seats.get(seat, '?'))}"
+            for seat in sorted(seats, key=lambda k: int(k)))))
+        lines.append('')
+
+        lines.append(L('text_roles_header'))
+        for player in players:
+            lines.append(L('text_role_row', seat=player.get('id'),
+                           job=i18n.name(i18n.JOB_NAMES, player.get('job'), lang),
+                           state=L('text_alive') if player.get('state') == 'Alive'
+                           else L('text_out')))
+        lines.append('')
+
+        lines.append(L('text_stream_header'))
+        lines.append(L('text_legend'))
+        # Number the rendered lines only: the event stream also carries bridge
+        # bookkeeping (snapshots, seat changes) that a reviewer never needs, and
+        # gaps in the numbering would read like missing content.
+        index = 0
+        for event in payload.get('events') or []:
+            kind = event.get('kind')
+            if kind not in RENDERED_EVENTS:
+                continue
+            index += 1
+            tag = f'#{index:04d}'
+            if kind in ('log', 'private'):
+                mark = L('text_public') if kind == 'log' else L('text_private')
+                body = (event.get('text') or event.get('raw') or '').strip()
+                if body:
+                    lines.append(f'{tag} [{mark}] {body}')
+            elif kind == 'prompt':
+                mark = L('text_private') if event.get('secret') else L('text_public')
+                who = L('text_seat_acting', seat=event.get('player'))
+                controller = L(f"controller_{event.get('controller', 'human')}")
+                question = (event.get('prompt') or event.get('raw') or '').strip()
+                lines.append(f"{tag} [{mark}] {who} ({controller}) {L('text_asks')} {question}")
+                if event.get('choices') is not None:
+                    lines.append(f'{tag}       {L("text_legal")} '
+                                 + ' / '.join(str(c) for c in event['choices']))
+            elif kind == 'answer':
+                mark = L('text_private') if event.get('secret') else L('text_public')
+                value = str(event.get('value') or '').strip() or L('text_blank')
+                lines.append(f"{tag} [{mark}] {L('text_seat_acting', seat=event.get('player'))} "
+                             f"{L('text_answers')} {value}")
+            elif kind == 'decision':
+                value = str(event.get('value') or '').strip() or L('text_blank')
+                head = (f"{tag}       {L('text_decision')} {event.get('label')} -> "
+                        f"{value}")
+                lines.append(head)
+                # "speech" is only a statement when the decision was a speech:
+                # a vote or a night action has no public sentence, so a model
+                # that fills the field is explaining itself, not talking
+                fields = [('speech', 'text_speech' if event.get('label') == 'speech'
+                           else 'text_thoughts'),
+                          ('reasoning', 'text_reasoning'), ('note', 'text_note')]
+                for field, key in fields:
+                    value = (event.get(field) or '').strip()
+                    if value:
+                        lines.append(f'{tag}       {L(key)} {value}')
+            elif kind == 'thinking':
+                label = L('text_thinking', seat=event.get('player'),
+                          kind=event.get('label'))
+                lines.append(f'{tag}       {label}')
+            elif kind == 'llm-error':
+                lines.append(f"{tag}       {L('text_error')} {event.get('text')}")
+            elif kind == 'history':
+                lines.append(f"{tag}       {L('text_history_dump')}")
+                lines.extend('       ' + row for row in (event.get('text') or '').splitlines())
+            elif kind == 'notice':
+                lines.append(f"{tag} [{L('text_public')}] {(event.get('text') or '').strip()}")
+        lines.append('')
+        lines.append(L('text_footer', steps=len(payload.get('answers') or [])))
+        return '\n'.join(lines) + '\n'
 
     def list_replays(self) -> list[dict[str, Any]]:
         '''Exported games, newest name first, for the console to offer.'''
@@ -466,11 +727,20 @@ class Session:
         return i18n.t(key, self.language, **params)
 
     def _player_signature(self) -> tuple[tuple[int, str], ...]:
+        '''
+        What the board shows.
+
+        The political state is part of it: electing a sheriff, tearing the badge
+        or a self-explosion all change the board without changing any player's
+        health, and the board must refresh for those too.
+        '''
         state = self.game.game_state if self.game is not None else None
         if state is None or state.players is None:
             return ()
-        return tuple((p.ID, p.player_state.name)
-                     for p in sorted(state.players.values(), key=lambda p: p.ID))
+        return tuple([(p.ID, p.player_state.name)
+                      for p in sorted(state.players.values(), key=lambda p: p.ID)]
+                     + [(-1, str(self.snapshot().get(key)))
+                        for key in ('sheriff', 'badge_broken', 'exploded')])
 
     def _harvest(self) -> None:
         '''
@@ -566,16 +836,31 @@ class Session:
         fallen = nights[-1] if nights else ()
 
         facts = [self._fact(key, **params) for key, params in self.memory.get(viewer, ())]
-        lookup = state.job_lookup_table or {}
-        if role == 'Wolf':
-            mates = [i for i in lookup.get(engine.Jobs.Wolf, ()) if i != viewer]
+        # The whole wolf camp shares the pack's knowledge, so the Wolf King and
+        # the wolves are told about each other
+        if role in {job.value for job in engine.GameRule.WolfCamp}:
+            pack = engine.GameRuleDefinitions.players_with(state, engine.GameRule.WolfCamp)
+            mates = [i for i in pack if i != viewer]
             if mates:
                 facts.append(self._fact('fact_fellow_wolf',
                                         ids=i18n.player_ids(mates, self.language)))
             if night and night.wolf_kills:
                 facts.append(self._fact('fact_pack_named',
                                         ids=i18n.player_ids(night.wolf_kills, self.language)))
+        elif role == 'Guard':
+            # 不能连守 is public knowledge once it has happened, but remembering
+            # whom you protected is the guard's own bookkeeping.
+            if state.guarded_players:
+                facts.append(self._fact('fact_guarded_before',
+                                        ids=i18n.player_ids(state.guarded_players, self.language)))
         elif role == 'Witch':
+            # The potions are one per game and the counts live on her action
+            # object, so without this a model has no way to know the limit.
+            action = players[viewer].job_actions
+            poison = getattr(action, 'poison_left', None)
+            antidote = getattr(action, 'antidote_left', None)
+            if poison is not None and antidote is not None:
+                facts.append(self._fact('fact_potions', poison=poison, antidote=antidote))
             if night and night.wolf_kills:
                 facts.append(self._fact('fact_wolves_killed',
                                         ids=i18n.player_ids(night.wolf_kills, self.language)))
@@ -583,6 +868,17 @@ class Session:
                 facts.append(self._fact('fact_you_killed', player=night.witch_killed_target))
             if night and night.witch_saved_target is not None:
                 facts.append(self._fact('fact_you_saved', player=night.witch_saved_target))
+
+        # The election exists only on day 1, and `day` carries the sheriff from
+        # the previous day once the new one has begun.
+        poll = (day.police_vote_person_camp or {}) if day else {}
+        candidates = tuple(poll.get(True, ())) if poll else ()
+        candidate_speeches = tuple(sorted((day.candidate_speech or {}).items())) if day else ()
+        sheriff = day.the_police if day else None
+        # A sheriff who has left play cannot act; report no sheriff instead of
+        # handing a model a stale seat that it might try to reason about.
+        if sheriff is not None and players[sheriff].player_state is engine.PlayerState.Exit:
+            sheriff = None
 
         return llm_interface.Observation(
             viewer=viewer,
@@ -597,6 +893,11 @@ class Session:
             earlier_rounds=self._render_history(),
             private_facts=tuple(facts),
             vote_tally=tally,
+            sheriff=sheriff,
+            sheriff_badge_broken=bool(day.break_the_police) if day else False,
+            sheriff_candidates=candidates,
+            candidate_speeches=candidate_speeches,
+            exploded_wolves=len(state.wolf_exposed or ()),
         )
 
     # -- state -------------------------------------------------------------
@@ -604,11 +905,19 @@ class Session:
         state = self.game.game_state if self.game is not None else None
         if state is None or state.players is None:
             return {'stage': 'Initializing', 'cycles': 1, 'exited': [], 'players': [], 'winner': None}
+        day = state.day
+        sheriff = day.the_police if day else None
+        if sheriff is not None and state.players[sheriff].player_state is engine.PlayerState.Exit:
+            sheriff = None
         return {
             'stage': state.stage.name,
             'cycles': state.cycles,
             'exited': list(state.exited_players or []),
             'winner': WINNERS.get(state.stage.name),
+            'sheriff': sheriff,
+            'badge_broken': bool(day.break_the_police) if day else False,
+            'candidates': list((day.police_vote_person_camp or {}).get(True, ())) if day else [],
+            'exploded': len(state.wolf_exposed or ()),
             'players': [
                 {'id': p.ID, 'job': p.job.value, 'state': p.player_state.name}
                 for p in sorted(state.players.values(), key=lambda p: p.ID)
@@ -627,9 +936,12 @@ class Session:
             'language': self.language,
             'languages': i18n.LANGUAGES,
             'llm': self.provider_config.describe(),
+            'models': self.model_report(),
             'llm_error': self.config_error,
             'show_prompts': self.show_prompts,
             'reveal_jobs': self.reveal_jobs,
+            'show_thinking': self.show_thinking,
+            'raw_output': self.raw_output,
             **self.snapshot(),
         }
 
@@ -713,7 +1025,6 @@ class Session:
 # from the outside. Each one names the core line that makes it necessary.
 CURRENT: Session | None = None
 
-_original_init_game = engine.Game.init_game
 _original_input_an_id = engine.JobAction.input_an_id
 _real_print = builtins.print
 _real_pprint = pprint_module.pprint
@@ -721,17 +1032,6 @@ _real_pprint = pprint_module.pprint
 
 def _engine_thread() -> bool:
     return CURRENT is not None and threading.current_thread() is CURRENT.thread
-
-
-def _init_game(self, *args, **kwargs):
-    _original_init_game(self, *args, **kwargs)
-    # engine.py appends to GameState.history at the end of every day, but the field
-    # defaults to None and is never assigned, so the first full cycle would raise
-    # AttributeError without this.
-    self.game_state.history = []
-    # _at_night reads a module-level `game` that only engine.py's `__main__` block
-    # defines, so importing engine.py as a module leaves it undefined.
-    engine.game = self
 
 
 def _input_an_id(prompt, required, player_id, key='ID', exclude=()):
@@ -761,6 +1061,17 @@ def _game_print(*args, sep=' ', end='\n'):
         _real_print('[Game]', *args, sep=sep, end=end)
 
 
+def _game_print_private(*args, sep=' ', end='\n'):
+    # engine.py's game_print_private: only the seat now acting may see it, so it
+    # goes to the private panel and is wiped when that seat is done.
+    if _engine_thread():
+        text = sep.join(str(a) for a in args)
+        CURRENT.emit({'kind': 'private', 'raw': text,
+                      'text': i18n.engine_text(text, CURRENT.language)})
+    else:
+        _real_print('[Game] [Private]', *args, sep=sep, end=end)
+
+
 def _print(*args, **kwargs):
     # The day's message summary uses a bare print rather than game_print, and no
     # module-level name can intercept a builtin.
@@ -785,9 +1096,9 @@ class _PprintProxy:
     pprint = staticmethod(_pprint)
 
 
-engine.Game.init_game = _init_game
 engine.JobAction.input_an_id = staticmethod(_input_an_id)
 engine.game_print = _game_print
+engine.game_print_private = _game_print_private
 engine.game_input = _game_input
 engine.clear_screen = lambda: None      # os.system('clear') would spew escapes
 engine.pprint = _PprintProxy()
@@ -819,10 +1130,11 @@ def handle(message: dict[str, Any]) -> None:
             CURRENT.start_replay(delay=float(message.get('delay', 0.3)), seed=int(raw) if raw else None)
         case 'seats':
             CURRENT.set_seats(message.get('seats') or {})
-        case 'llm':
-            CURRENT.configure_llm(message.get('config') or {})
         case 'llm-test':
             CURRENT.test_llm()
+        case 'models-reload':
+            if CURRENT.reload_models():
+                CURRENT.emit({'kind': 'models', 'models': CURRENT.model_report()})
         case 'export':
             CURRENT.export_replay(str(message.get('name') or ''))
         case 'replay-file':
@@ -832,8 +1144,12 @@ def handle(message: dict[str, Any]) -> None:
         case 'options':
             CURRENT.show_prompts = bool(message.get('show_prompts', CURRENT.show_prompts))
             CURRENT.reveal_jobs = bool(message.get('reveal_jobs', CURRENT.reveal_jobs))
+            CURRENT.raw_output = bool(message.get('raw_output', CURRENT.raw_output))
+            CURRENT.show_thinking = bool(message.get('show_thinking', CURRENT.show_thinking))
             CURRENT.emit({'kind': 'options', 'show_prompts': CURRENT.show_prompts,
-                          'reveal_jobs': CURRENT.reveal_jobs})
+                          'reveal_jobs': CURRENT.reveal_jobs,
+                          'show_thinking': CURRENT.show_thinking,
+                          'raw_output': CURRENT.raw_output})
         case other:
             CURRENT.emit({'kind': 'notice',
                           'text': i18n.t('unknown_message', CURRENT.language, what=repr(other))})

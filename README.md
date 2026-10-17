@@ -8,6 +8,8 @@ A simple game emulated the classic Werewolf game, allowing LLMs to play
 
 📖 **[engine/README.md](engine/README.md)**
 
+🗒️ 每次提交的改动摘要见 **[UPDATE.md](UPDATE.md)**（最新的在最前面）。
+
 > 该文件是本文档的唯一来源（canonical）。请只修改它，根目录的 README.md 仅作为入口指引。
 >
 > `engine/README.md` is the single source of truth for this documentation. Edit that file only;
