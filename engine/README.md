@@ -18,15 +18,26 @@ A simple game emulated the classic Werewolf game, allowing LLMs to play
 
 | 项目 | 要求 |
 | --- | --- |
-| Python | 3.12 及以上（开发环境为 3.14.7） |
+| Python | 3.12 及以上（本仓库的 conda 环境为 3.14.8） |
 | 网络 | 能访问 DeepSeek API |
 | 密钥 | DeepSeek API Key |
 
-> 建议至少 Python 3.12 以上, 否则需要改动部分类型注释写法
+> 代码里的前向类型注解依赖 `from __future__ import annotations`，因此 3.12/3.13/3.14 都可以运行。
 
 ## 快速开始
 
 ### 1. 安装依赖
+
+推荐使用 conda（环境名 `werewolf`，对应本仓库的开发环境）：
+
+```bash
+conda create -n werewolf python=3.14 -y
+conda activate werewolf
+cd engine
+python -m pip install -r requirements.txt
+```
+
+也可以继续使用 `venv`：
 
 ```bash
 cd engine
@@ -123,6 +134,12 @@ kind     = deepseek
 ### 3. 启动
 
 ```bash
+# conda 环境（推荐）
+conda activate werewolf
+cd engine
+python run.py
+
+# 或 venv
 ./venv/bin/python run.py
 ```
 
@@ -209,13 +226,35 @@ engine/
     └── run_all.py         # 运行全部测试
 ```
 
+## 实现状态
+
+### 已实现
+
+- **12 人标准局规则**：3 狼 + 1 狼王 + 4 神职 + 4 平民；守卫 → 狼人 → 预言家 → 女巫的夜晚顺序；警长竞选、1.5 票、警徽移交/撕毁；狼人自爆；猎人/狼王开枪；屠边胜负与 10 轮平局。
+- **真人 / 模型混合对局**：12 个座位可独立切换；每个座位可绑定 `models.json` 中的不同 profile；支持 DeepSeek、OpenAI、Anthropic 和任意 OpenAI 兼容网关。
+- **模型容错**：JSON 修复、非法动作回退、思考预算耗尽时自动放大预算重试、`reasoning_content` 回收。
+- **Web 操作台**：WebSocket 实时推送、公开/私有信息隔离、模型思考与提示词查看、中英文切换、固定信息条、断线重连。
+- **对局记录**：固定随机种子（`seed`）保证可复现；导出 `.json` 回放和可选 `.txt` 阅读稿；离线回放不联网、不调用模型。
+- **测试**：`tests/run_all.py` 共 135 个用例，覆盖规则、整局不变量、桥接、隐私、回放、导出和模型配置。
+
+### 尚未实现 / 后续可做
+
+- **多房间与鉴权**：当前是单进程单对局（`ui.CURRENT`），所有连接的浏览器共享同一张桌子；没有登录、房间或观众/玩家权限区分。
+- **对局中途存档/恢复**：目前只能导出已结束的对局；服务重启会丢失进行中的游戏。
+- **回放控制**：只能按固定间隔重放，没有暂停、拖动进度、单步；导出文件只能从服务端 `replays/` 选择，不支持浏览器上传/下载。
+- **批量模拟与评测**：没有 headless/批量对局入口，也没有跨局胜率、投票、发言或模型决策质量的统计。
+- **可配置规则**：人数和角色配比目前固定在 `PLAYERS_COUNT` / `GameRule.Roles`，页面不能新建规则集。
+- **模型与工程化**：没有流式输出、取消、token/费用统计；依赖未锁定版本，也没有 CI、`pyproject.toml` 或打包配置。
+- **文档**：`engine/doc.md` 仍是空文件；规则细节以 `rule.md` 与 README 为准。
+
 ## 运行测试
 
 ```bash
+conda activate werewolf
 cd engine
-./venv/bin/python tests/run_all.py              # 全部测试
-./venv/bin/python tests/run_all.py rules        # 只跑 test_rules.py
-./venv/bin/python tests/run_all.py -k sheriff   # 只跑名字包含 sheriff 的用例
+python tests/run_all.py              # 全部测试
+python tests/run_all.py rules        # 只跑 test_rules.py
+python tests/run_all.py -k sheriff   # 只跑名字包含 sheriff 的用例
 ```
 
 测试不需要 API 密钥，也不会联网：所有请求由 `tests/support.py` 中的 `Driver` 用合法选项代替回答。

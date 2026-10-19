@@ -195,6 +195,31 @@ class Shots(unittest.TestCase):
             engine.GameRuleDefinitions.begin_day(state)
         self.assertEqual(driver.shoot_prompts(), 1)
 
+    def test_hunter_cannot_shoot_another_player_who_died_tonight(self):
+        '''
+        rule.md: the hunter may shoot "任意一个存活玩家".
+
+        On the dawn after a multi-death night the other victims are still
+        PlayerState.Dead (they only become Exit as begin_day walks the list),
+        so the target pool must be built from Alive, not exited_players.
+        '''
+        state = support.new_state(jobs={3: Jobs.Hunter})
+        support.kill(state, 3)   # the hunter, killed by the wolves
+        support.kill(state, 9)   # another victim of the same night
+        state.night.wolf_kills = [3, 9]
+
+        with support.Driver(pass_rate=0.0) as driver:
+            # Aim at a living seat so the only thing under test is the pool.
+            driver.pick = lambda key, legal, voter, prompt: (
+                10 if 'shoot' in prompt else legal[0])
+            engine.GameRuleDefinitions.begin_day(state)
+
+        self.assertNotIn(9, driver.legal['ID'],
+                         'the other player who died tonight is not alive')
+        self.assertNotIn(3, driver.legal['ID'], 'the hunter cannot shoot himself')
+        self.assertIn(10, driver.legal['ID'], 'living seats stay legal targets')
+        self.assertIsNot(state.players[9].out_reason, OutReason.Shot_By_Hunter)
+
     def test_hunter_does_not_shoot_when_poisoned(self):
         state = support.new_state(jobs={7: Jobs.Hunter})
         support.kill(state, 7)
