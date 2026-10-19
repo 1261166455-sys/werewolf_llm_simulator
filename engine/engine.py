@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import random
 import pprint
@@ -323,7 +325,10 @@ class WitchAction(JobAction):
 
 class WolfKingAction(WolfAction):
     '''
-    The Wolf King kills with the pack. His one-off power is not implemented yet.
+    The Wolf King kills with the pack.
+
+    When he is exiled, he may shoot one living player once. He has no shot
+    when he dies any other way (night kill, poison, or a hunter's shot).
     '''
     def on_exit(self, reason, game, player):
         if reason is OutReason.Voted:
@@ -363,7 +368,10 @@ class GuardAction(JobAction):
 
 class HunterAction(JobAction):
     '''
-    Placeholder: the hunter's dying shot is not implemented yet.
+    The hunter takes no night action.
+
+    When he is exiled or killed by the wolves, he may shoot one living player
+    once. A poisoned hunter cannot shoot.
     '''
     def reply(self, player, exclude=(), cycle: int | None = None, **_):
         return {}
@@ -373,7 +381,17 @@ class HunterAction(JobAction):
 
     def on_exit(self, reason, game, player):
         if reason is OutReason.Voted or reason is OutReason.Wolf_Killed:
-            target_player_id = self.input_an_id('You can shoot 1 person, input an ID: ', False, player.ID, exclude=tuple(set(game.exited_players) | set([player.ID])))
+            # Only a living player may be shot. At dawn the night's other
+            # victims are still Dead, not yet Exit, so excluding only
+            # exited_players would wrongly offer them as targets.
+            targets = tuple(player_id for player_id, p in game.players.items()
+                            if p.player_state is PlayerState.Alive)
+            if not targets:
+                game_print('No one was shot')
+                return
+            exclude = tuple(player_id for player_id in game.players
+                            if player_id not in targets)
+            target_player_id = self.input_an_id('You can shoot 1 person, input an ID: ', False, player.ID, exclude=exclude)
             if 'ID' in target_player_id:
                 game_print(f'Player {target_player_id["ID"]} was shot by player {player.ID}')
                 if GameRuleDefinitions.should_transmit_the_budge(game, target_player_id['ID']):
@@ -548,8 +566,8 @@ class GameRuleDefinitions:
     One static method per phase, taking the GameState it mutates. GameRule names
     the phases and their order; Game._at_night/_at_day run them.
 
-    A phase that is not implemented yet is left as `pass`: it still runs in its
-    place in the order, it just has no effect.
+    A phase with nothing to do (a civilian at night, for example) is left as
+    `pass`: it still runs in its place in the order, it just has no effect.
     '''
 
     @staticmethod
@@ -613,8 +631,8 @@ class GameRuleDefinitions:
         '''
         Every living wolf names a victim, and a wolf may pass.
 
-        The Wolf King is a wolf, so he hunts with the pack; his one-off power is
-        a rule of its own and is not implemented yet.
+        The Wolf King is a wolf, so he hunts with the pack; his one-off shot
+        happens in WolfKingAction.on_exit when he is exiled.
         '''
         
         pack = GameRuleDefinitions.players_with(state, GameRule.WolfCamp)
