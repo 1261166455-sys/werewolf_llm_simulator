@@ -91,6 +91,11 @@ class WholeGames(unittest.TestCase):
                 kills = night.wolf_kills or []
                 self.assertEqual(len(kills), len(set(kills)), f'seed {seed}: {kills}')
 
+    def test_the_pack_kills_at_most_one_player_a_night(self):
+        for seed, state, _, _ in self.games:
+            for night, _ in state.history:
+                self.assertLessEqual(len(night.wolf_kills or []), 1, f'seed {seed}')
+
 
 class SeatBounds(unittest.TestCase):
     def probe(self, *answers):

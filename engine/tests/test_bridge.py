@@ -128,7 +128,7 @@ class Decisions(unittest.TestCase):
     decoder must validate what comes back.'''
 
     PROMPTS = [
-        ('[Wolf] Please input an player ID to kill (leave blank to skip): ', 'ID', 'kill'),
+        ('[Wolf pack] Propose a player to kill (the most proposed player dies; leave blank to skip): ', 'ID', 'pack_kill'),
         ("[Prophet] Input a player's ID to query its state: ", 'ID', 'query'),
         ("[Witch] Input a player's ID to kill: ", 'kill', 'kill'),
         ("[Witch] Input a player's ID to save (Please select one who was killed tonight): ", 'save', 'save'),
@@ -280,6 +280,25 @@ class WolfCampView(unittest.TestCase):
             view = self.session._private_view(seat)
             self.assertNotIn('狼王', str(view['camp_mates']),
                              'camp mates travel as ids, so no rank can leak')
+
+    def test_a_later_wolf_sees_the_proposals_already_made(self):
+        '''
+        The pack discusses in seat order, so a wolf who has not yet spoken must
+        see what its packmates proposed - but not its own proposal.
+        '''
+        state = self.session.game.game_state
+        original = state.night
+        state.night = engine.NightHistory(wolf_kills=[], wolf_proposals={0: 5, 1: None})
+        try:
+            later = ' '.join(self.session.observation(2).private_facts)
+            first = ' '.join(self.session.observation(0).private_facts)
+        finally:
+            state.night = original
+        lang = self.session.language
+        said = i18n.t('fact_pack_proposal_target', lang, wolf=0, target=5)
+        self.assertIn(said, later)
+        self.assertIn(i18n.t('fact_pack_proposal_pass', lang, wolf=1), later)
+        self.assertNotIn(said, first, 'a wolf is not shown its own proposal')
 
 
 class Replay(Session):
@@ -706,6 +725,86 @@ class Export(Session):
                 path.unlink(missing_ok=True)
                 path.with_suffix('.txt').unlink(missing_ok=True)
 
+    def test_an_export_records_the_rules_it_was_played_under(self):
+        self.session.start_game(seed=99)
+        self.session.thread.join(timeout=180)
+        path = self.session.export_replay('unit-rule-version')
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(payload.get('rule_version'), engine.GameRule.Version)
+            self.assertEqual(payload.get('version'), ui.REPLAY_VERSION)
+            entry = {e['name']: e for e in self.session.list_replays()}[path.name]
+            self.assertTrue(entry['compatible'])
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_an_export_of_this_rule_version_replays(self):
+        self.session.start_game(seed=94)
+        self.session.thread.join(timeout=180)
+        path = self.session.export_replay('unit-replayable')
+        original_delay = ui.REPLAY_DELAY
+        ui.REPLAY_DELAY = 0            # a test does not need the viewing pause
+        try:
+            self.assertTrue(self.session.replay_file(path.name))
+            self.session.thread.join(timeout=180)
+            self.assertEqual(self.session.status, 'finished')
+            self.assertIsNone(self.session.timing_payload(),
+                              'a replay is not a timed game')
+        finally:
+            ui.REPLAY_DELAY = original_delay
+            path.unlink(missing_ok=True)
+
+    def test_a_replay_from_another_rule_version_is_refused(self):
+        self.session.start_game(seed=93)
+        self.session.thread.join(timeout=180)
+        path = self.session.export_replay('unit-old-rules')
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            payload['rule_version'] = '2.0'
+            path.write_text(json.dumps(payload), encoding='utf-8')
+
+            entry = {e['name']: e for e in self.session.list_replays()}[path.name]
+            self.assertFalse(entry['compatible'],
+                             'an old file stays listed but is marked unreplayable')
+            self.assertEqual(entry['rule_version'], '2.0')
+
+            self.assertFalse(self.session.replay_file(path.name))
+            notices = [e['text'] for e in self.session.events if e.get('kind') == 'notice']
+            self.assertTrue(any('2.0' in text for text in notices),
+                            f'a version mismatch must be reported: {notices}')
+
+            # a file exported before versioning carries no rule_version at all
+            payload.pop('rule_version')
+            path.write_text(json.dumps(payload), encoding='utf-8')
+            self.assertFalse(self.session.replay_file(path.name))
+            self.assertTrue(any('没有记录规则版本' in e.get('text', '')
+                                for e in self.session.events if e.get('kind') == 'notice'),
+                            'a legacy export must be reported as unversioned')
+            self.assertEqual(self.session.status, 'finished',
+                             'a refused replay must not start a game')
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_timing_is_recorded_and_exported(self):
+        self.session.start_game(seed=92)
+        self.session.thread.join(timeout=180)
+        timing = self.session.timing_payload()
+        self.assertIsNotNone(timing)
+        self.assertTrue(timing['started_at'] and timing['finished_at'])
+        self.assertEqual(len(timing['actions']), len(self.session.answers),
+                         'one action record per decision')
+        self.assertAlmostEqual(
+            sum(a['seconds'] for a in timing['actions']),
+            sum(p['total_seconds'] for p in timing['players']), places=2,
+            msg='the per-player totals must add up to the recorded actions')
+        path = self.session.export_replay('unit-timing')
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(payload['timing']['total_seconds'], timing['total_seconds'])
+            self.assertTrue(payload['timing']['players'])
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_export_with_raw_output_writes_a_readable_companion(self):
         self.session.raw_output = True
         self.session.start_game(seed=97)
@@ -732,6 +831,39 @@ class Export(Session):
                 path.unlink(missing_ok=True)
                 text_path.unlink(missing_ok=True)
             self.session.raw_output = False
+
+
+class Timing(unittest.TestCase):
+    '''Total and per-action clocks, kept only for a real game.'''
+
+    def test_an_idle_session_has_no_clock(self):
+        session = ui.Session()
+        self.assertFalse(session.timing_snapshot()['recorded'])
+        self.assertIsNone(session.timing_payload())
+
+    def test_the_action_clock_starts_and_resets(self):
+        session = ui.Session()
+        session.status = 'running'
+        session._game_started = ui.time.monotonic() - 1.5
+        session.game = engine.Game()
+        session.game.game_state = support.new_state()
+
+        self.assertTrue(session._begin_action('[Vote] Vote whom? ', 3, {'key': 'ID'}))
+        live = session.timing_snapshot()
+        self.assertTrue(live['recorded'] and live['running'])
+        self.assertEqual(live['player'], 3, 'the clock names the seat deciding')
+
+        session._end_action()
+        self.assertEqual(session.timing_snapshot()['action_seconds'], 0.0,
+                         'the action clock resets when the decision is done')
+        payload = session.timing_payload()
+        seat = next(row for row in payload['players'] if row['id'] == 3)
+        self.assertEqual(seat['actions'], 1)
+        self.assertEqual(payload['actions'][0]['decision'], 'vote')
+        self.assertEqual(len(payload['players']), engine.PLAYERS_COUNT,
+                         'every seat is reported, even one who never acted')
+        self.assertGreaterEqual(payload['total_seconds'], 1.4,
+                                'the total clock ran from the game start')
 
 
 if __name__ == '__main__':

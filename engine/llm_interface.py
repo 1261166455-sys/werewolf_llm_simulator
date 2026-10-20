@@ -69,6 +69,7 @@ class DecodeError(ValueError):
 class DecisionKind(Enum):
     '''What the engine is currently asking a player to do.'''
     Kill = 'kill'                 # 女巫 poison
+    PackKill = 'pack_kill'        # 狼队 collective proposal
     Save = 'save'                 # 女巫 antidote
     Query = 'query'               # 预言家
     Guard = 'guard'               # 守卫
@@ -102,6 +103,10 @@ def classify(key: str, prompt: str) -> DecisionKind:
     text = prompt.lower()
     if 'addresser' in text or 'speecher' in text:
         return DecisionKind.Speech
+    # The pack's proposal is not the witch's poison: keeping them apart stops a
+    # Chinese wolf from being asked which player it wants to poison.
+    if 'propose a player to kill' in text:
+        return DecisionKind.PackKill
     if key in ('target', 'guard'):
         return DecisionKind.Guard
     if key == 'save':
@@ -260,9 +265,11 @@ NIGHT, in this order:
 1. Guard: names one player to protect, or passes. He may protect himself. The
    same player may not be protected two nights in a row. A protected player
    survives the Wolves' kill, but NOT the Witch's poison.
-2. Wolves (including the Wolf King): each names one player to kill, or passes.
-   They may name anyone alive, including a Wolf or themselves - every player
-   named by any Wolf dies, so a divided pack kills more than one player.
+2. Wolves (including the Wolf King): the pack discusses in seat order and agrees
+   on at most one victim. Each living Wolf proposes one living player, or passes,
+   and sees the proposals already made tonight. The most-proposed player dies; a
+   tie, or every Wolf passing, means nobody dies. A Wolf may propose a packmate
+   or himself.
 3. Prophet: names one living player other than herself and learns that player's
    camp (good or wolf). The Wolf King reads as a wolf.
 4. Witch: she is shown tonight's victims. She may use her poison once per game
@@ -309,8 +316,9 @@ WINNING:
 夜晚按顺序进行：
 1. 守卫：守护一名玩家或放弃，可以守护自己；同一名玩家不能连续两晚被守护。
    被守护者可以免疫狼刀，但不能免疫女巫的毒药。
-2. 狼人（包括狼王）：各自指定一名玩家击杀或放弃。可以选择任意存活玩家，
-   包括狼人和自己；被任意狼人指定的玩家都会死亡，因此狼队意见分散时可能死多人。
+2. 狼人（包括狼王）：狼队按座位顺序商议，最多击杀一名玩家。每位存活狼人提议一名
+   存活玩家或放弃，并能看到今晚此前队友的提议。被提议最多的玩家死亡；票数并列或
+   全部放弃则无人死亡。狼人可以提议同阵营的狼人或自己。
 3. 预言家：指定一名自己之外的存活玩家，得知其阵营（好人/狼人）。狼王属于狼人阵营。
 4. 女巫：会看到今晚被狼人击杀的玩家。全局只有一瓶毒药和一瓶解药：
    毒药可以对任意非己存活玩家使用；解药只能救今晚被狼杀的玩家，从第二晚起可以自救。
@@ -344,11 +352,15 @@ ROLE_BRIEFING: dict[str, dict[str, str]] = {
     'en': {
         'Wolf': (
             "You are told who the rest of the pack is, including the Wolf King. "
-            "Killing the good side and keeping suspicion off yourself is how you "
-            "win. You may claim any role when you speak, but never contradict a "
-            "packmate in public. During your own statement you may also declare "
-            "yourself a Wolf: that ends the day at once and costs you your life, "
-            "so only do it to stop a vote that would kill a packmate."
+            "Every night the pack discusses in seat order: each of you proposes "
+            "one living player, and the most-proposed player dies - an even split "
+            "kills nobody, so a scattered pack wastes the night. If you speak "
+            "later you see what your packmates proposed. Killing the good side and "
+            "keeping suspicion off yourself is how you win. You may claim any role "
+            "when you speak, but never contradict a packmate in public. During "
+            "your own statement you may also declare yourself a Wolf: that ends "
+            "the day at once and costs you your life, so only do it to stop a vote "
+            "that would kill a packmate."
         ),
         'Wolf King': (
             "You hunt with the pack and know your packmates. If you are voted out "
@@ -389,7 +401,7 @@ ROLE_BRIEFING: dict[str, dict[str, str]] = {
         ),
     },
     'zh': {
-        'Wolf': "你会得知包括狼王在内的全部狼队友。击杀好人、让自己不被怀疑就是获胜方式。发言时可以伪装成其他身份，但不要与狼队友公开矛盾。你也可以在自己发言时自爆：当天立即结束、你会出局，只有在能阻止狼队被投票放逐时才值得这么做。",
+        'Wolf': "你会得知包括狼王在内的全部狼队友。每晚狼队按座位顺序商议：每人提议一名存活玩家，被提议最多者死亡——票数并列则无人死亡，所以提议分散会浪费这一晚；后发言的狼人能看到队友此前的提议。击杀好人、让自己不被怀疑就是获胜方式。发言时可以伪装成其他身份，但不要与狼队友公开矛盾。你也可以在自己发言时自爆：当天立即结束、你会出局，只有在能阻止狼队被投票放逐时才值得这么做。",
         'Wolf King': "你与狼队一同行动，并知道所有狼队友。若你被投票放逐，可以在出局时开枪带走一名存活玩家，用来换掉一个神职；但夜里被刀死时不能开枪。",
         'Prophet': "每晚你可以指定一名自己之外的存活玩家，得知其阵营；结果会累积在你的私人记录中。狼王会被验成狼人。你与好人阵营一同获胜。过早跳身份容易在夜里被杀，一直沉默又会让狼人掌控投票。",
         'Witch': "全局只有一瓶毒药和一瓶解药。你会看到今晚被狼杀的玩家：毒药可以对任意非己存活玩家使用，解药只能救今晚被狼杀的玩家（第二晚起可以自救）。毒药优先：被毒死的玩家无法被救回；若你救的人同时被守卫守护，他仍然会死。",
@@ -473,7 +485,8 @@ LABELS: dict[str, dict[str, str]] = {
         'corrective': ('Your previous reply was rejected: {error}\n'
                        'Previous reply was: {previous}\n'
                        'Answer again with a single valid JSON object.'),
-        'kind_kill': 'kill', 'kind_save': 'save', 'kind_query': 'query',
+        'kind_kill': 'kill', 'kind_pack_kill': 'pack proposal',
+        'kind_save': 'save', 'kind_query': 'query',
         'kind_guard': 'guard', 'kind_vote': 'vote', 'kind_speech': 'speech',
         'kind_shot': 'shoot', 'kind_badge': 'badge', 'kind_badge_target': 'badge hand-over',
         'kind_police': 'run for sheriff',
@@ -518,13 +531,13 @@ LABELS: dict[str, dict[str, str]] = {
         'corrective': ('你上一次的回复被拒绝：{error}\n'
                        '上一次的回复是：{previous}\n'
                        '请重新只输出一个合法的 JSON 对象。'),
-        'kind_kill': '击杀', 'kind_save': '救人', 'kind_query': '查验',
+        'kind_kill': '击杀', 'kind_pack_kill': '狼队商议', 'kind_save': '救人', 'kind_query': '查验',
         'kind_guard': '守护', 'kind_vote': '投票', 'kind_speech': '发言',
         'kind_shot': '开枪', 'kind_badge': '警徽', 'kind_badge_target': '警徽移交',
         'kind_police': '竞选警长',
         'kind_expose': '自爆', 'kind_speech_order': '发言顺序',
         'kind_generic': '行动',
-        'q_kill': '你今晚要击杀哪名玩家？',
+        'q_pack_kill': '狼队今晚要击杀哪名玩家？（被提议最多者死亡；票数并列则无人死亡）',
         'q_save': '你要救下哪名玩家？',
         'q_query': '你要查验哪名玩家？',
         'q_guard': '你今晚要守护哪名玩家？（可以守护自己，也可以放弃）',

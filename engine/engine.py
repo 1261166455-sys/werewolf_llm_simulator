@@ -5,6 +5,7 @@ import random
 import pprint
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Sequence
@@ -193,17 +194,16 @@ class WolfAction(JobAction):
             self.opponents = kw.copy()
 
     def reply(self, player, exclude=(), cycle: int | None = None, **_):
-        resp = JobAction.input_an_id('[Wolf] Please input an player ID to kill (leave blank to skip): ', False, player.ID, exclude=exclude)
+        resp = JobAction.input_an_id('[Wolf pack] Propose a player to kill (the most proposed player dies; leave blank to skip): ', False, player.ID, exclude=exclude)
         super().reply(player, exclude)
         return resp
     
     def execute(self, game, _, cycle: int | None = None, **kwargs):
-        # Pass an ID parameter to kill the player with that ID.
-        # The victims are a union, not a tally: every named player dies, so when
-        # both wolves name the same player the announcement must not list them
-        # twice.
-        if 'ID' in kwargs and kwargs['ID'] not in game.night.wolf_kills:
-            game.night.wolf_kills.append(kwargs['ID'])
+        # A proposal, not a kill: the pack's single victim is decided once every
+        # living wolf has spoken (see wolf_do_night). None means a pass.
+        if game.night.wolf_proposals is None:
+            game.night.wolf_proposals = {}
+        game.night.wolf_proposals[_.ID] = kwargs.get('ID')
 
     def comment(self, game, player, allow_expose: bool = True) -> bool:
         '''
@@ -458,7 +458,10 @@ class NightHistory:
     '''
     Represent game changes at 1 night
     '''
+    # The one victim the pack agreed on (0 or 1 entry), after the discussion
     wolf_kills: list[int] | None = None
+    # Each living wolf's proposal this night: seat -> target, None for a pass
+    wolf_proposals: dict[int, int | None] | None = None
     query_target: int | None = None
     witch_killed_target: int | None = None
     witch_saved_target: int | None = None
@@ -531,7 +534,10 @@ class GameRule:
     Everything that separates one ruleset from another lives here, so the phase
     definitions below stay generic and a new job is mostly a matter of data.
     '''
-    Version = '2.0'
+    # Bumped when a rule changes in a way that makes earlier recorded games
+    # play out differently: 2.1 made the wolf pack agree on one victim instead
+    # of each wolf killing its own target.
+    Version = '2.1'
 
     # How many of each job a full table holds. Must add up to PLAYERS_COUNT.
     Roles = {
@@ -590,6 +596,23 @@ class GameRuleDefinitions:
                 if player.player_state is not PlayerState.Exit]
 
     @staticmethod
+    def pack_kill(proposals: dict[int, int | None] | None) -> list[int]:
+        '''
+        The one victim the pack agreed on, as a 0- or 1-item list.
+
+        共同商议: the most-proposed player dies. A split pack (a tie for the
+        most proposals) agreed on nobody, and a pack that all passes kills
+        nobody either - matching the day vote's 平票不驱逐.
+        '''
+        tally = Counter(target for target in (proposals or {}).values()
+                        if target is not None)
+        if not tally:
+            return []
+        top = max(tally.values())
+        leaders = [target for target, votes in tally.items() if votes == top]
+        return leaders if len(leaders) == 1 else []
+
+    @staticmethod
     def death_reason(state: "GameState", player_id: int) -> OutReason:
         '''
         How a player died tonight. The witch's poison outranks the pack.
@@ -623,28 +646,42 @@ class GameRuleDefinitions:
 
     @staticmethod
     def begin_night(state: "GameState") -> None:
-        state.night = NightHistory(wolf_kills=[])
+        state.night = NightHistory(wolf_kills=[], wolf_proposals={})
         game_print(f'Night {state.cycles} approach')
 
     @staticmethod
     def wolf_do_night(state: "GameState") -> None:
         '''
-        Every living wolf names a victim, and a wolf may pass.
+        The pack discusses tonight's victim, then kills at most one player.
 
-        The Wolf King is a wolf, so he hunts with the pack; his one-off shot
-        happens in WolfKingAction.on_exit when he is exiled.
+        Every living wolf - the Wolf King included - proposes in seat order and
+        sees the proposals already made tonight. The player with the most
+        proposals dies; a tie, or all wolves passing, means nobody dies. Any
+        living player may be proposed: 可以杀同阵营的狼, 也可以不杀.
         '''
-        
-        pack = GameRuleDefinitions.players_with(state, GameRule.WolfCamp)
+        state.night.wolf_proposals = {}
+        pack = sorted(GameRuleDefinitions.players_with(state, GameRule.WolfCamp))
+        # `exclude` is the *disallowed* set, so an exited (or already dead) seat
+        # stays out of reach while the pack's own seats stay legal targets.
+        out_of_reach = tuple(player_id for player_id, p in state.players.items()
+                             if p.player_state is not PlayerState.Alive)
         for player_id in pack:
             p = state.players[player_id]
             if p.player_state is not PlayerState.Alive:
                 continue
+            if state.night.wolf_proposals:
+                said = ', '.join(
+                    f'Player {wolf} -> ' + ('pass' if target is None else f'Player {target}')
+                    for wolf, target in sorted(state.night.wolf_proposals.items()))
+                game_print_private(f'Pack proposals so far: {said}')
             p.job_actions.reset()
             p.job_actions.provide()
-            # Avoid killing wolves themselves (Now this rule removed in 12-seat game rule)
             p.job_actions.execute(state, p, **p.job_actions.reply(
-                player=p, cycle=state.cycles, exclude=tuple(state.exited_players or ())))
+                player=p, cycle=state.cycles, exclude=out_of_reach))
+
+        # The decision stays secret until the dawn announcement: the witch learns
+        # the victim below, and everyone else only when the day begins.
+        state.night.wolf_kills = GameRuleDefinitions.pack_kill(state.night.wolf_proposals)
 
     @staticmethod
     def prophet_do_night(state: "GameState") -> None:

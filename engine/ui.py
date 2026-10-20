@@ -40,7 +40,10 @@ REPLAY_DIR = Path(__file__).resolve().parent / 'replays'
 MODELS_PATH = Path(os.getenv('LLM_MODEL_CONFIG')
                    or Path(__file__).resolve().parent / 'models.json')
 REPLAY_FORMAT = 'werewolf-replay'
-REPLAY_VERSION = 1
+# Bumped when the payload shape changes. A file is replayable only while its
+# `rule_version` matches engine.GameRule.Version: a recorded answer sequence
+# means nothing once the prompts or the rules they answer have changed.
+REPLAY_VERSION = 2
 REPLAY_DELAY = 0.3
 
 
@@ -149,6 +152,18 @@ class Session:
         # which export is being replayed, for the status line
         self.copy: dict[str, Any] = {}
 
+        # Wall-clock and monotonic timing for a real game only: a replay would
+        # time the replay, not the players who originally acted. `_game_started`
+        # is the monotonic anchor, `_action_started` the anchor of the decision
+        # currently being asked.
+        self.game_started_at: str | None = None
+        self.game_finished_at: str | None = None
+        self._game_started: float | None = None
+        self._game_finished: float | None = None
+        self._action_started: float | None = None
+        self._action_meta: dict[str, Any] | None = None
+        self.action_times: list[dict[str, Any]] = []
+
     # -- engine thread side ------------------------------------------------
     def emit(self, event: dict[str, Any], record: bool = True) -> None:
         event = dict(event)
@@ -178,6 +193,129 @@ class Session:
     def end_structured_input(self) -> None:
         self.structured = None
 
+    # -- timing ------------------------------------------------------------
+    def _reset_timing(self) -> None:
+        '''Forget the previous game's clock. Called when a game starts.'''
+        self.game_started_at = None
+        self.game_finished_at = None
+        self._game_started = None
+        self._game_finished = None
+        self._action_started = None
+        self._action_meta = None
+        self.action_times = []
+
+    def timing_snapshot(self) -> dict[str, Any]:
+        '''
+        The live clock for the console and the `snapshot` message.
+
+        `total_seconds` freezes once the game ends; `action_seconds` is the
+        decision in progress and is 0 between decisions, which is what "resets
+        when a player finishes" means. `recorded` is false for idle sessions and
+        replays, so the console knows to hide the clock.
+        '''
+        if self._game_started is None:
+            return {'recorded': False, 'running': False,
+                    'total_seconds': 0.0, 'action_seconds': 0.0, 'player': None}
+        end = self._game_finished if self._game_finished is not None else time.monotonic()
+        action = 0.0
+        if self._action_started is not None:
+            action = max(0.0, time.monotonic() - self._action_started)
+        return {
+            'recorded': True,
+            'running': self.status == 'running',
+            'total_seconds': round(max(0.0, end - self._game_started), 3),
+            'action_seconds': round(action, 3),
+            'player': (self._action_meta or {}).get('player'),
+        }
+
+    def _begin_action(self, prompt: str, player: int, meta: dict[str, Any]) -> bool:
+        '''Start the clock for one decision. Returns False when not timed.'''
+        if self._game_started is None or self.status != 'running':
+            return False
+        state = self.game.game_state if self.game is not None else None
+        self._action_meta = {
+            'player': player,
+            'role': state.players[player].job.value if state and state.players else None,
+            'decision': llm_interface.classify(str(meta.get('key') or ''), prompt).value,
+            'controller': 'llm' if self.seats.get(player) == 'llm' else 'human',
+        }
+        self._action_started = time.monotonic()
+        # Not part of the transcript: the clock is live state, and the export
+        # keeps the full record under `timing` instead.
+        self.emit({'kind': 'timing', **self.timing_snapshot()}, record=False)
+        return True
+
+    def _end_action(self) -> None:
+        '''Record the finished decision and reset the action clock to zero.'''
+        if self._action_started is None or self._action_meta is None:
+            return
+        seconds = max(0.0, time.monotonic() - self._action_started)
+        state = self.game.game_state if self.game is not None else None
+        record = {
+            'index': len(self.action_times),
+            **self._action_meta,
+            'cycle': state.cycles if state is not None else None,
+            'stage': state.stage.name if state is not None else None,
+            'started_at': time.strftime('%Y-%m-%d %H:%M:%S',
+                                        time.localtime(time.time() - seconds)),
+            'seconds': round(seconds, 3),
+        }
+        self.action_times.append(record)
+        self._action_started = None
+        self._action_meta = None
+        self.emit({'kind': 'timing', **self.timing_snapshot()}, record=False)
+
+    def _finish_timing(self) -> None:
+        if self._game_started is not None and self._game_finished is None:
+            self._game_finished = time.monotonic()
+            self.game_finished_at = time.strftime('%Y-%m-%d %H:%M:%S')
+        self._action_started = None
+        self._action_meta = None
+        if self._game_started is not None:
+            self.emit({'kind': 'timing', **self.timing_snapshot()}, record=False)
+
+    def timing_payload(self) -> dict[str, Any] | None:
+        '''
+        Per-game and per-player action timings for the export JSON.
+
+        None when no real game was timed (idle, or a replay), so a consumer can
+        tell "no data" from "a game with no decisions".
+        '''
+        if self._game_started is None:
+            return None
+        end = self._game_finished if self._game_finished is not None else time.monotonic()
+        # Every seat gets a row, including one who never acted (0 actions), so a
+        # downstream analysis can treat the table as fixed-size.
+        players: dict[int, dict[str, Any]] = {}
+        state = self.game.game_state if self.game is not None else None
+        if state is not None and state.players:
+            for player_id, player in state.players.items():
+                players[player_id] = {
+                    'id': player_id, 'role': player.job.value,
+                    'actions': 0, 'total_seconds': 0.0, 'max_seconds': 0.0,
+                }
+        for record in self.action_times:
+            entry = players.setdefault(record['player'], {
+                'id': record['player'], 'role': record.get('role'),
+                'actions': 0, 'total_seconds': 0.0, 'max_seconds': 0.0,
+            })
+            entry['actions'] += 1
+            entry['total_seconds'] += record['seconds']
+            entry['max_seconds'] = max(entry['max_seconds'], record['seconds'])
+        for entry in players.values():
+            entry['total_seconds'] = round(entry['total_seconds'], 3)
+            entry['max_seconds'] = round(entry['max_seconds'], 3)
+            entry['avg_seconds'] = round(entry['total_seconds'] / entry['actions'], 3) \
+                if entry['actions'] else 0.0
+        return {
+            'recorded': True,
+            'started_at': self.game_started_at,
+            'finished_at': self.game_finished_at,
+            'total_seconds': round(max(0.0, end - self._game_started), 3),
+            'players': [players[key] for key in sorted(players)],
+            'actions': [dict(record) for record in self.action_times],
+        }
+
     def request_answer(self, prompt: str, player: int) -> str:
         meta = dict(self.structured) if self.structured else {'key': None, 'required': False, 'choices': None}
         if self._replay_script is not None:
@@ -185,9 +323,14 @@ class Session:
             # the recorded answers back in, which is what makes it free and exact.
             return self._recorded_answer(prompt, player, meta)
         self._harvest()
-        if self.seats.get(player) == 'llm':
-            return self._llm_answer(prompt, player, meta)
-        return self._human_answer(prompt, player, meta)
+        timed = self._begin_action(prompt, player, meta)
+        try:
+            if self.seats.get(player) == 'llm':
+                return self._llm_answer(prompt, player, meta)
+            return self._human_answer(prompt, player, meta)
+        finally:
+            if timed:
+                self._end_action()
 
     def _secret(self, prompt: str, meta: dict[str, Any]) -> bool:
         '''
@@ -521,12 +664,16 @@ class Session:
         payload = {
             'format': REPLAY_FORMAT,
             'version': REPLAY_VERSION,
+            'rule_version': engine.GameRule.Version,
             'exported_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'complete': self.status == 'finished',
             'language': self.language,
             'seed': self.seed,
             'model': {'kind': self.provider_config.kind, 'model': self.provider_config.model},
             'seats': dict(self.seats),
+            # Wall-clock and per-decision timings for later analysis. None for a
+            # replay, which is not timing real players.
+            'timing': self.timing_payload(),
             # the roles and fates belong in the record too: the .json is the
             # replayable half, and the .txt renders this same block as prose
             'result': self.snapshot(),
@@ -571,6 +718,8 @@ class Session:
         lines = [L('text_title'), '']
         lines.append(L('text_exported_at', when=payload.get('exported_at', '')))
         lines.append(L('text_seed', seed=payload.get('seed')))
+        lines.append(L('text_rule_version',
+                       version=payload.get('rule_version') or '?'))
         lines.append(L('text_model', model=f"{model.get('kind', '')}/{model.get('model', '')}"))
         lines.append(L('text_language', code=lang))
         lines.append(L('text_rounds', stage=result.get('stage', ''),
@@ -678,6 +827,10 @@ class Session:
                 'steps': len(payload.get('answers') or []),
                 'complete': bool(payload.get('complete')),
                 'exported_at': payload.get('exported_at', ''),
+                # A file from another rule version stays listed but cannot be
+                # replayed: the recorded answers were given to different prompts.
+                'rule_version': payload.get('rule_version'),
+                'compatible': payload.get('rule_version') == engine.GameRule.Version,
             })
         return items
 
@@ -688,6 +841,11 @@ class Session:
         Re-simulation rather than playback: the recorded answers are fed back
         through the engine, so the transcript is reproduced by the real rules and
         no model is called.
+
+        Only an export recorded under the current `engine.GameRule.Version` is
+        replayed: its answers were given to prompts of that rule set, so a file
+        from another version is refused instead of silently producing a
+        different game.
         '''
         if self.status in ('running', 'replaying'):
             self.emit({'kind': 'notice', 'text': i18n.t('busy', self.language)})
@@ -708,6 +866,16 @@ class Session:
         if payload.get('format') != REPLAY_FORMAT or payload.get('seed') is None or not answers:
             self.emit({'kind': 'notice', 'text': i18n.t('replay_bad', self.language,
                                                         error='missing seed or answers')})
+            return False
+        recorded = payload.get('rule_version')
+        if recorded != engine.GameRule.Version:
+            if recorded:
+                text = i18n.t('replay_incompatible', self.language, file=path.name,
+                              recorded=recorded, current=engine.GameRule.Version)
+            else:
+                text = i18n.t('replay_no_version', self.language, file=path.name,
+                              current=engine.GameRule.Version)
+            self.emit({'kind': 'notice', 'text': text})
             return False
 
         self.seed = int(payload['seed'])
@@ -847,6 +1015,19 @@ class Session:
             if night and night.wolf_kills:
                 facts.append(self._fact('fact_pack_named',
                                         ids=i18n.player_ids(night.wolf_kills, self.language)))
+            # The pack discusses in seat order, so a wolf speaking later sees
+            # what its packmates have proposed. Their final victim is not shown:
+            # it is only settled after the last wolf has spoken.
+            earlier = [(wolf, target) for wolf, target in
+                       sorted((night.wolf_proposals or {}).items() if night else ())
+                       if wolf != viewer]
+            if earlier:
+                joiner = '；' if self.language == 'zh' else '; '
+                items = joiner.join(
+                    self._fact('fact_pack_proposal_pass', wolf=wolf) if target is None
+                    else self._fact('fact_pack_proposal_target', wolf=wolf, target=target)
+                    for wolf, target in earlier)
+                facts.append(self._fact('fact_pack_proposals', items=items))
         elif role == 'Guard':
             # 不能连守 is public knowledge once it has happened, but remembering
             # whom you protected is the guard's own bookkeeping.
@@ -942,6 +1123,7 @@ class Session:
             'reveal_jobs': self.reveal_jobs,
             'show_thinking': self.show_thinking,
             'raw_output': self.raw_output,
+            'timing': self.timing_snapshot(),
             **self.snapshot(),
         }
 
@@ -959,8 +1141,13 @@ class Session:
         self.exited_seen.clear()
         self._seen_players = ()
         self._drain_inbox()
+        # A real game is timed from the moment it starts; a replay never is.
+        self._reset_timing()
+        self.game_started_at = time.strftime('%Y-%m-%d %H:%M:%S')
+        self._game_started = time.monotonic()
         self.emit({'kind': 'reset'})
         self._spawn(replay_script=None, delay=0.0, status='running')
+        self.emit({'kind': 'timing', **self.timing_snapshot()}, record=False)
 
     def start_replay(self, delay: float = 0.3, seed: int | None = None) -> None:
         if self.status in ('running', 'replaying'):
@@ -973,8 +1160,11 @@ class Session:
         if seed is not None:
             self.seed = int(seed)
         self.events.clear()
+        # Replaying is not a timed game: hide any clock from the last one.
+        self._reset_timing()
         self.emit({'kind': 'reset'})
         self._spawn(replay_script=script, delay=max(0.0, float(delay)), status='replaying')
+        self.emit({'kind': 'timing', **self.timing_snapshot()}, record=False)
 
     def _spawn(self, replay_script: list[str] | None, delay: float, status: str) -> None:
         self._replay_script = replay_script
@@ -1016,6 +1206,7 @@ class Session:
             self.emit({'kind': 'status', 'state': 'error', 'message': self.message, **self.snapshot()})
             self.emit({'kind': 'log', 'text': traceback.format_exc()})
         finally:
+            self._finish_timing()
             self._replay_script = None
             self._replay_delay = 0.0
 

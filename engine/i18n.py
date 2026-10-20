@@ -106,9 +106,9 @@ _ENGINE: dict[str, list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], s
         (re.compile(r'^Invalid target chosen, please re-input\s*$'),
          '目标不合法，请重新输入'),
         # the prompts themselves
-        (re.compile(r'^\[Wolf\] Please input an player ID to kill'
-                    r' \(leave blank to skip\):\s*$'),
-         '[狼人] 请输入要击杀的玩家编号（留空表示跳过）：'),
+        (re.compile(r'^\[Wolf pack\] Propose a player to kill'
+                    r' \(the most proposed player dies; leave blank to skip\):\s*$'),
+         '[狼队] 请提议今晚击杀的玩家（被提议最多者死亡；留空表示不杀）：'),
         (re.compile(r"^\[Prophet\] Input a player's ID to query its state:\s*$"),
          '[预言家] 请输入要查验的玩家编号：'),
         (re.compile(r"^\[Witch\] Input a player's ID to kill:\s*$"),
@@ -297,6 +297,15 @@ MESSAGES: dict[str, dict[str, str]] = {
     'replay_missing': {'en': 'no such export: {file}', 'zh': '找不到导出文件：{file}'},
     'replay_bad': {'en': 'cannot read that export ({error})',
                    'zh': '无法读取该导出文件（{error}）'},
+    'replay_incompatible': {
+        'en': 'cannot replay {file}: it was recorded under rules {recorded}, '
+              'but this engine runs {current}',
+        'zh': '无法回放 {file}：该文件记录于规则版本 {recorded}，当前引擎为 {current}'},
+    'replay_no_version': {
+        'en': 'cannot replay {file}: it records no rule version (exported before '
+              'rules {current}); re-export it with this engine',
+        'zh': '无法回放 {file}：该文件没有记录规则版本（导出于 {current} 之前的旧版本），'
+              '请用当前引擎重新导出'},
     'replaying_file': {'en': 'replaying {file} ({steps} steps)',
                        'zh': '正在回放 {file}（{steps} 步）'},
     'unknown_language': {'en': 'unsupported language: {code}',
@@ -308,6 +317,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         'zh': '狼人杀对局文本记录 —— 仅供人工复盘，本文件不能用于回放'},
     'text_exported_at': {'en': 'exported at : {when}', 'zh': '导出时间   : {when}'},
     'text_seed': {'en': 'seed        : {seed}', 'zh': '随机种子   : {seed}'},
+    'text_rule_version': {'en': 'rules       : {version} (not replayable under another version)',
+                          'zh': '规则版本   : {version}（跨版本不可回放）'},
     'text_model': {'en': 'model       : {model}', 'zh': '模型       : {model}'},
     'text_language': {'en': 'language    : {code}', 'zh': '界面语言   : {code}'},
     'text_rounds': {'en': 'progress    : {stage}, round {cycles} ({state})',
@@ -359,6 +370,12 @@ MESSAGES: dict[str, dict[str, str]] = {
                          'zh': '你的狼队友是 {ids}。'},
     'fact_pack_named': {'en': 'Tonight the pack has named {ids} to die.',
                         'zh': '今晚狼队已指定 {ids} 出局。'},
+    'fact_pack_proposals': {'en': "The pack's proposals so far: {items}.",
+                            'zh': '狼队目前的提议：{items}。'},
+    'fact_pack_proposal_target': {'en': 'Player {wolf} proposes Player {target}',
+                                  'zh': '玩家{wolf} 提议击杀玩家{target}'},
+    'fact_pack_proposal_pass': {'en': 'Player {wolf} passes',
+                                'zh': '玩家{wolf} 提议不杀'},
     'fact_wolves_killed': {'en': 'Tonight the Wolves killed {ids}.',
                            'zh': '今晚狼人击杀了 {ids}。'},
     'fact_you_killed': {'en': 'You chose to kill Player {player} tonight.',

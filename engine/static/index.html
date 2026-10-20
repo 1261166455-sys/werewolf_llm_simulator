@@ -46,6 +46,7 @@
     font-size: 12px;
     color: var(--dim);
   }
+  .pill[hidden] { display: none; }
   .pill.running { color: var(--accent); border-color: var(--accent); }
   .pill.replaying { color: var(--warn); border-color: var(--warn); }
   .pill.finished { color: var(--ok); border-color: var(--ok); }
@@ -233,6 +234,8 @@
   <h1 data-i18n="title">狼人杀操作台</h1>
   <span class="pill" id="status">connecting…</span>
   <span class="pill" id="seed"></span>
+  <span class="pill" id="total-time" hidden></span>
+  <span class="pill" id="action-time" hidden></span>
   <div class="spacer"></div>
   <div class="controls">
     <label><span data-i18n="seed">种子</span> <input type="number" id="seed-input" data-i18n-placeholder="randomSeed" placeholder="随机"></label>
@@ -305,6 +308,43 @@
 const el = id => document.getElementById(id);
 const logEl = el('log'), boardEl = el('board'), barEl = el('promptbar');
 const statusEl = el('status'), seedEl = el('seed');
+const totalTimeEl = el('total-time'), actionTimeEl = el('action-time');
+
+// The clock is anchored to the server's numbers and only *ticked* locally, so a
+// slow network cannot make the console drift: every timing event re-anchors it.
+let clock = { total: 0, action: 0, running: false, recorded: false, player: null, at: 0 };
+
+function formatClock(seconds) {
+  const whole = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(whole / 3600);
+  const minutes = String(Math.floor((whole % 3600) / 60)).padStart(2, '0');
+  const secs = String(whole % 60).padStart(2, '0');
+  return hours ? `${hours}:${minutes}:${secs}` : `${minutes}:${secs}`;
+}
+
+function applyTiming(ev) {
+  clock.total = Number(ev.total_seconds) || 0;
+  clock.action = Number(ev.action_seconds) || 0;
+  clock.running = !!ev.running;
+  clock.recorded = !!ev.recorded;
+  clock.player = ev.player == null ? null : ev.player;
+  clock.at = performance.now();
+  renderClock();
+}
+
+function renderClock() {
+  const delta = clock.running ? Math.max(0, (performance.now() - clock.at) / 1000) : 0;
+  // The total runs for the whole game; the action clock runs only while a seat
+  // is deciding and shows 00:00 between decisions (it resets when one finishes).
+  const total = clock.total + delta;
+  const action = clock.player == null ? 0 : clock.action + delta;
+  totalTimeEl.hidden = !(clock.recorded && (clock.running || total > 0));
+  actionTimeEl.hidden = !(clock.recorded && clock.running);
+  if (!totalTimeEl.hidden) totalTimeEl.textContent = L('totalTime', { time: formatClock(total) });
+  if (!actionTimeEl.hidden) actionTimeEl.textContent = L('actionTime', { time: formatClock(action) });
+}
+
+window.setInterval(renderClock, 250);
 
 let socket = null;
 let pending = false;       // the server is blocked waiting for an answer
@@ -321,6 +361,7 @@ let lastPromptText = '';
 const I18N = {
   zh: {
     title: '狼人杀操作台', language: '语言', seed: '种子', randomSeed: '随机',
+    totalTime: '总用时 {time}', actionTime: '当前行动 {time}',
     newGame: '新游戏', replayDelay: '回放间隔', replayLast: '回放上一局',
     autoplay: '自动操作', setup: '模型与座位', summary: '{human} 名真人 / {model} 名模型',
     viewModels: '查看模型配置', reloadModels: '重新读取配置',
@@ -335,7 +376,8 @@ const I18N = {
     rawOutput: '导出附文本记录', noOperator: '当前没有玩家操作',
     privMark: '[私]',
     exportGame: '导出本局', replayFiles: '导出文件', replaySelected: '回放所选',
-    noExports: '（暂无导出文件）', steps: '{n} 步', send: '发送', message: '发言内容',
+    noExports: '（暂无导出文件）', steps: '{n} 步',
+    ruleMismatch: '规则 {version} · 不可回放', ruleUnversioned: '旧版本 · 不可回放', send: '发送', message: '发言内容',
     waiting: '等待引擎…', modelDeciding: '模型思考中…', replaying: '回放中…',
     thinking: '正在决策', cycle: '第 {n} 轮', human: '真人', modelSeat: '模型',
     blank: '（空）', pass: '弃权', skipGiveUp: '弃权（不投票）', skipSave: '不使用解药',
@@ -353,13 +395,14 @@ const I18N = {
     stageInit: '初始化', stageReady: '初始化完成', stageNight: '夜晚', stageDay: '白天',
     endCivilian: '好人阵营获胜', endWolf: '狼人阵营获胜', endTie: '平局',
     runIdle: '空闲', runRunning: '进行中', runReplaying: '回放中', runFinished: '已结束', runError: '错误',
-    kindKill: '击杀', kindSave: '救人', kindQuery: '查验', kindVote: '投票',
+    kindKill: '击杀', kindPackKill: '狼队商议', kindSave: '救人', kindQuery: '查验', kindVote: '投票',
     kindSpeech: '发言', kindGeneric: '行动', kindGuard: '守护', kindShot: '开枪',
     kindBadge: '警徽', kindBadgeTarget: '警徽移交', kindPolice: '竞选警长', kindExpose: '自爆',
     kindSpeechOrder: '发言顺序',
   },
   en: {
     title: 'Werewolf Operator Console', language: 'language', seed: 'seed', randomSeed: 'random',
+    totalTime: 'total {time}', actionTime: 'action {time}',
     newGame: 'New game', replayDelay: 'replay delay', replayLast: 'Replay last',
     autoplay: 'autoplay', setup: 'Model & seats', summary: '{human} human / {model} model',
     viewModels: 'view model config', reloadModels: 'reload config',
@@ -374,7 +417,8 @@ const I18N = {
     rawOutput: 'also save a .txt record', noOperator: 'nobody is operating',
     privMark: '[priv]',
     exportGame: 'Export game', replayFiles: 'exports', replaySelected: 'Replay selected',
-    noExports: '(no exports yet)', steps: '{n} steps', send: 'Send', message: 'message',
+    noExports: '(no exports yet)', steps: '{n} steps',
+    ruleMismatch: 'rules {version} · not replayable', ruleUnversioned: 'old export · not replayable', send: 'Send', message: 'message',
     waiting: 'waiting for the engine…', modelDeciding: 'model is deciding…', replaying: 'replaying…',
     thinking: 'is deciding', cycle: 'cycle {n}', human: 'human', modelSeat: 'model',
     blank: '(blank)', pass: 'to pass', skipGiveUp: 'skip (give up)', skipSave: 'skip save',
@@ -392,7 +436,7 @@ const I18N = {
     stageInit: 'Initializing', stageReady: 'Finished_Initializing', stageNight: 'Night', stageDay: 'Day',
     endCivilian: 'End_Civilian_Win', endWolf: 'End_Wolf_Win', endTie: 'End_Tie',
     runIdle: 'idle', runRunning: 'running', runReplaying: 'replaying', runFinished: 'finished', runError: 'error',
-    kindKill: 'kill', kindSave: 'save', kindQuery: 'query', kindVote: 'vote',
+    kindKill: 'kill', kindPackKill: 'pack proposal', kindSave: 'save', kindQuery: 'query', kindVote: 'vote',
     kindSpeech: 'speech', kindGeneric: 'generic', kindGuard: 'guard', kindShot: 'shoot',
     kindBadge: 'badge', kindBadgeTarget: 'badge hand-over', kindPolice: 'run for sheriff', kindExpose: 'self-explosion',
     kindSpeechOrder: 'speaking order',
@@ -415,7 +459,7 @@ const STATE_KEY = { Alive: 'stateAlive', Dead: 'stateDead', Exit: 'stateExit' };
 // Kinds whose question names the role ("input the player's ID to poison"), so
 // seeing the question is as good as seeing the role. Their traffic belongs in
 // the private panel; speech and vote are public and stay in the transcript.
-const SECRET_KINDS = new Set(['kill', 'save', 'query', 'guard', 'generic', 'expose']);
+const SECRET_KINDS = new Set(['kill', 'pack_kill', 'save', 'query', 'guard', 'generic', 'expose']);
 
 // When on, private traffic is also written into the transcript with a marker,
 // which is the only way to read a whole game in order. Off by default: while a
@@ -437,7 +481,7 @@ const STAGE_KEY = {
 };
 const RUN_KEY = { idle: 'runIdle', running: 'runRunning', replaying: 'runReplaying',
                   finished: 'runFinished', error: 'runError' };
-const KIND_KEY = { kill: 'kindKill', save: 'kindSave', query: 'kindQuery', vote: 'kindVote',
+const KIND_KEY = { kill: 'kindKill', pack_kill: 'kindPackKill', save: 'kindSave', query: 'kindQuery', vote: 'kindVote',
                    speech: 'kindSpeech', generic: 'kindGeneric', guard: 'kindGuard',
                    shot: 'kindShot', badge: 'kindBadge', badge_target: 'kindBadgeTarget',
                    police: 'kindPolice',
@@ -572,8 +616,13 @@ function renderReplays(files) {
       file.complete ? '' : '…',
       L('cycle', { n: file.cycles }),
       L('steps', { n: file.steps }),
+      file.compatible === false
+        ? (file.rule_version ? L('ruleMismatch', { version: file.rule_version })
+                             : L('ruleUnversioned')) : '',
     ].filter(Boolean).join(' · ');
     option.title = `${file.name}  ${file.exported_at}`;
+    // answers recorded under another rule version cannot be replayed here
+    option.disabled = file.compatible === false;
     select.appendChild(option);
   }
   if (previous && files.some(f => f.name === previous)) select.value = previous;
@@ -1025,6 +1074,9 @@ function apply(ev, record = true) {
     case 'replays':
       renderReplays(ev.files);
       break;
+    case 'timing':
+      applyTiming(ev);
+      break;
     case 'options':
       loadOptions(ev);
       break;
@@ -1065,6 +1117,7 @@ function apply(ev, record = true) {
       seedEl.textContent = ev.seed != null ? `${L('seed')} ${ev.seed}` : '';
       setStatus([stageName(ev.stage), L('cycle', { n: ev.cycles }), runStateName(ev.status), ev.message]
         .filter(Boolean).join(' · '), ev.status);
+      applyTiming(ev.timing || {});
       rebuild(ev.events || []);
       if (ev.llm_error) addLine(`! ${ev.llm_error}`, 'notice');
       break;

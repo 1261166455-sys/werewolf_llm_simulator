@@ -52,6 +52,60 @@ class Roles(unittest.TestCase):
             self.assertIn(job, engine.JOB_ACTIONS, job)
 
 
+class WolfPack(unittest.TestCase):
+    '''共同商议: 3 狼 + 1 狼王 商定至多一名受害者.'''
+
+    def build(self, dead=()):
+        state = support.new_state(jobs={1: Jobs.Wolf, 2: Jobs.Wolf, 3: Jobs.Wolf_King})
+        for player_id in dead:
+            support.kill(state, player_id)
+        return state
+
+    def run_pack(self, state, picks, pass_rate=0.0):
+        with support.Driver(pass_rate=pass_rate) as driver:
+            driver.pick = lambda key, legal, voter, prompt: picks[voter]
+            engine.GameRuleDefinitions.wolf_do_night(state)
+        return driver
+
+    def test_the_most_proposed_player_is_the_only_victim(self):
+        state = self.build()
+        self.run_pack(state, {1: 5, 2: 5, 3: 6})
+        self.assertEqual(state.night.wolf_kills, [5],
+                         'the pack agreed on one player, so only that player dies')
+
+    def test_a_split_pack_kills_nobody(self):
+        state = self.build()
+        self.run_pack(state, {1: 5, 2: 6, 3: 7})
+        self.assertEqual(state.night.wolf_kills, [],
+                         'a tie is not agreement: 平票则无人死亡')
+
+    def test_a_pack_that_all_passes_kills_nobody(self):
+        state = self.build()
+        self.run_pack(state, {1: 5, 2: 6, 3: 7}, pass_rate=1.0)
+        self.assertEqual(state.night.wolf_kills, [])
+
+    def test_every_living_wolf_proposes_including_the_king(self):
+        state = self.build(dead=[2])
+        driver = self.run_pack(state, {1: 5, 3: 5})
+        self.assertEqual(sorted(state.night.wolf_proposals), [1, 3],
+                         'a dead wolf does not take part, the Wolf King does')
+        self.assertEqual([player for _, player, _, _ in driver.prompts], [1, 3],
+                         'the pack speaks in seat order')
+
+    def test_the_pack_may_propose_its_own(self):
+        state = self.build()
+        driver = self.run_pack(state, {1: 3, 2: 3, 3: 3})
+        self.assertIn(1, driver.legal['ID'])
+        self.assertIn(3, driver.legal['ID'])
+        self.assertEqual(state.night.wolf_kills, [3], '可以杀同阵营的狼')
+
+    def test_an_exited_seat_is_not_a_target(self):
+        state = self.build()
+        support.exited(state, 4)
+        driver = self.run_pack(state, {1: 5, 2: 5, 3: 5})
+        self.assertNotIn(4, driver.legal['ID'])
+
+
 class Prophet(unittest.TestCase):
     def test_sees_the_wolf_king_as_a_wolf(self):
         state = support.new_state(jobs={1: Jobs.Prophet, 3: Jobs.Wolf_King, 4: Jobs.Wolf})
